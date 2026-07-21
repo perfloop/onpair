@@ -108,6 +108,10 @@ if err != nil {
 fmt.Println(string(buf[:n]))
 ```
 
+`DecompressString` and `DecompressAllChecked` treat buffer bytes beyond the
+returned length as scratch space: the fast decode path may overwrite them
+(never past `len(buf)`). Use `buf[:n]` only.
+
 ### Bulk decode with error handling
 
 ```go

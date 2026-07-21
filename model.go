@@ -3,7 +3,7 @@ package onpair
 // Model is a reusable trained dictionary.
 type Model struct {
 	config          Config
-	matcher         *Matcher
+	matcher         *matcher
 	dictionary      []byte
 	tokenBoundaries []uint32
 }
@@ -32,8 +32,8 @@ func (m *Model) Train(strings []string) error {
 	data, endPositions := flattenStrings(strings)
 	matcher, dict, tokenBoundaries := enc.train(data, endPositions)
 	m.matcher = matcher
-	m.dictionary = append(m.dictionary[:0], dict...)
-	m.tokenBoundaries = append(m.tokenBoundaries[:0], tokenBoundaries...)
+	m.dictionary = dict
+	m.tokenBoundaries = tokenBoundaries
 	return nil
 }
 
@@ -46,12 +46,11 @@ func (m *Model) Encode(strings []string) (*Archive, error) {
 	data, endPositions := flattenStrings(strings)
 	compressedData, stringBoundaries := enc.compress(data, endPositions, m.matcher)
 
-	dict := append([]byte(nil), m.dictionary...)
 	tokenBoundaries := append([]uint32(nil), m.tokenBoundaries...)
 	return &Archive{
 		CompressedData:          compressedData,
 		StringBoundaries:        stringBoundaries,
-		Dictionary:              dict,
+		Dictionary:              padDictionary(m.dictionary),
 		TokenBoundaries:         tokenBoundaries,
 		compressedTokenBitWidth: resolveTokenBitWidth(enc.config),
 	}, nil
@@ -75,7 +74,7 @@ func (e *Encoder) Encode(strings []string) (*Archive, error) {
 	return &Archive{
 		CompressedData:          compressedData,
 		StringBoundaries:        stringBoundaries,
-		Dictionary:              dict,
+		Dictionary:              padDictionary(dict),
 		TokenBoundaries:         tokenBoundaries,
 		compressedTokenBitWidth: resolveTokenBitWidth(e.config),
 	}, nil
