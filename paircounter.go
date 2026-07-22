@@ -47,7 +47,9 @@ func (t *pairCounter) incr(key uint32) uint16 {
 	}
 	h := hashPairKey(key) & t.mask
 	firstTomb := -1
+	steps := 0
 	for {
+		steps++
 		e := &t.entries[h]
 		switch e.state {
 		case 0:
@@ -63,10 +65,12 @@ func (t *pairCounter) incr(key uint32) uint16 {
 				e.state = 1
 			}
 			t.count++
+			recordPairCounterProbe(steps, t.count+t.tombstone, len(t.entries))
 			return 1
 		case 1:
 			if e.key == key {
 				e.count++
+				recordPairCounterProbe(steps, t.count+t.tombstone, len(t.entries))
 				return e.count
 			}
 		case 2:
