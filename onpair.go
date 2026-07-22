@@ -128,32 +128,34 @@ func (e *Encoder) train(data []byte, endPositions []int) (*matcher, []byte, []ui
 		return matcher, dictionary, tokenBoundaries
 	}
 
-	// Create shuffled indices
-	shuffledIndices := make([]int, numStrings)
-	for i := range shuffledIndices {
-		shuffledIndices[i] = i
-	}
-
-	// Simple deterministic shuffle (LCG)
-	state := uint64(42)
-	for i := len(shuffledIndices) - 1; i > 0; i-- {
-		state = state*6364136223846793005 + 1442695040888963407
-		j := int(state % uint64(i+1))
-		shuffledIndices[i], shuffledIndices[j] = shuffledIndices[j], shuffledIndices[i]
-	}
-
-	// Sample if data is large - use first N shuffled strings up to the configured sample size.
-	sampleIndices := shuffledIndices
-	sampleBytes := len(data)
 	trainingSampleBytes := resolveTrainingSampleBytes(e.config)
-	if len(data) > trainingSampleBytes {
-		if e.config.TemplateStratified {
+	sampleBytes := len(data)
+	var sampleIndices []int
+	if len(data) > trainingSampleBytes && !e.config.TemplateStratified {
+		// The plain sampled path consumes only a prefix, so draw that prefix
+		// without materializing a permutation for rows that will not be scanned.
+		sampleIndices, sampleBytes = sampleIndicesByBytes(endPositions, trainingSampleBytes)
+	} else {
+		// The full-data and template-stratified paths consume the complete
+		// permutation, so preserve their existing deterministic shuffle.
+		shuffledIndices := make([]int, numStrings)
+		for i := range shuffledIndices {
+			shuffledIndices[i] = i
+		}
+
+		state := uint64(42)
+		for i := len(shuffledIndices) - 1; i > 0; i-- {
+			state = state*6364136223846793005 + 1442695040888963407
+			j := int(state % uint64(i+1))
+			shuffledIndices[i], shuffledIndices[j] = shuffledIndices[j], shuffledIndices[i]
+		}
+
+		sampleIndices = shuffledIndices
+		if len(data) > trainingSampleBytes {
 			maxClusters := resolveTemplateMaxClusters(e.config)
 			sampleIndices, sampleBytes = stratifiedSampleIndicesByTemplateKey(
 				data, endPositions, shuffledIndices, trainingSampleBytes, maxClusters,
 			)
-		} else {
-			sampleIndices, sampleBytes = sampleIndicesByBytes(shuffledIndices, endPositions, trainingSampleBytes)
 		}
 	}
 
@@ -212,20 +214,48 @@ func resolveTemplateMaxClusters(cfg Config) int {
 	return defaultTemplateMaxClusters
 }
 
-func sampleIndicesByBytes(shuffledIndices []int, endPositions []int, sampleLimit int) ([]int, int) {
-	if sampleLimit <= 0 || len(shuffledIndices) == 0 {
-		return shuffledIndices, 0
+// sampleIndicesByBytes draws a deterministic, without-replacement row sample
+// until it reaches sampleLimit. Its sparse swap map represents only the prefix
+// of a Fisher-Yates permutation that the plain sampled path consumes.
+func sampleIndicesByBytes(endPositions []int, sampleLimit int) ([]int, int) {
+	numStrings := len(endPositions) - 1
+	if sampleLimit <= 0 || numStrings <= 0 {
+		return nil, 0
 	}
 
-	sampleSize := 0
-	for i, idx := range shuffledIndices {
-		strLen := endPositions[idx+1] - endPositions[idx]
-		sampleSize += strLen
-		if sampleSize >= sampleLimit {
-			return shuffledIndices[:i+1], sampleSize
+	sampleCapacity := numStrings
+	if averageRowBytes := endPositions[numStrings] / numStrings; averageRowBytes > 0 {
+		sampleCapacity = sampleLimit/averageRowBytes + 1
+		if sampleCapacity > numStrings {
+			sampleCapacity = numStrings
 		}
 	}
-	return shuffledIndices, sampleSize
+	sampleIndices := make([]int, 0, sampleCapacity)
+	swaps := make(map[int]int, sampleCapacity)
+	sampleSize := 0
+	state := uint64(42)
+	for remaining := numStrings; remaining > 0 && sampleSize < sampleLimit; remaining-- {
+		state = state*6364136223846793005 + 1442695040888963407
+		position := int(state % uint64(remaining))
+		index := position
+		if moved, ok := swaps[position]; ok {
+			index = moved
+		}
+
+		last := remaining - 1
+		replacement := last
+		if moved, ok := swaps[last]; ok {
+			replacement = moved
+		}
+		if position != last {
+			swaps[position] = replacement
+		}
+		delete(swaps, last)
+
+		sampleIndices = append(sampleIndices, index)
+		sampleSize += endPositions[index+1] - endPositions[index]
+	}
+	return sampleIndices, sampleSize
 }
 
 func stratifiedSampleIndicesByTemplateKey(

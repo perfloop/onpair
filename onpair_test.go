@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -448,6 +449,40 @@ func TestStratifiedSampleIndicesByTemplateKey(t *testing.T) {
 	}
 	if !seenA || !seenB {
 		t.Fatalf("expected sample to include both clusters, got %v", sample)
+	}
+}
+
+func TestSampleIndicesByBytesWithoutReplacement(t *testing.T) {
+	rows := []string{
+		"alpha-000", "alpha-001", "beta-002", "beta-003",
+		"gamma-004", "gamma-005", "delta-006", "delta-007",
+	}
+	_, endPositions := flattenStrings(rows)
+	sampleLimit := len(rows[0])*3 + 1
+
+	first, firstBytes := sampleIndicesByBytes(endPositions, sampleLimit)
+	second, secondBytes := sampleIndicesByBytes(endPositions, sampleLimit)
+	if !slices.Equal(first, second) || firstBytes != secondBytes {
+		t.Fatalf("sample must be deterministic: first=%v/%d second=%v/%d", first, firstBytes, second, secondBytes)
+	}
+	if firstBytes < sampleLimit {
+		t.Fatalf("sample bytes = %d, want at least %d", firstBytes, sampleLimit)
+	}
+
+	seen := make([]bool, len(rows))
+	computedBytes := 0
+	for _, index := range first {
+		if index < 0 || index >= len(rows) {
+			t.Fatalf("sample index %d outside [0, %d)", index, len(rows))
+		}
+		if seen[index] {
+			t.Fatalf("sample selected row %d more than once: %v", index, first)
+		}
+		seen[index] = true
+		computedBytes += len(rows[index])
+	}
+	if computedBytes != firstBytes {
+		t.Fatalf("sample bytes = %d, computed %d", firstBytes, computedBytes)
 	}
 }
 
