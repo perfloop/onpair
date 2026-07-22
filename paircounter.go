@@ -42,7 +42,7 @@ func hashPairKey(k uint32) uint32 {
 
 // incr increments the count for key, inserting if absent. Returns the new count.
 func (t *pairCounter) incr(key uint32) uint16 {
-	if (t.count+t.tombstone+1)*4 >= len(t.entries)*3 {
+	if (t.count+t.tombstone+1)*2 >= len(t.entries) {
 		t.grow()
 	}
 	h := hashPairKey(key) & t.mask
@@ -104,7 +104,7 @@ func (t *pairCounter) grow() {
 	old := t.entries
 	newSize := uint32(len(old)) * 2
 	// If tombstone pressure is the real cause, same-size rehash suffices.
-	if t.count*2 < len(old) {
+	if t.tombstone > 0 && t.count*2 < len(old) {
 		newSize = uint32(len(old))
 	}
 	t.entries = make([]pairEntry, newSize)
