@@ -35,59 +35,54 @@ const (
 // skips the table probe entirely when no stored pattern starts with those
 // bytes.
 type matcher struct {
-	longMatchBuckets longBucketTable // 8-byte prefix → candidate bucket with suffix-length order
-	shortMatchLookup [9]u64U16Table  // length → (prefix, token ID)
-	lengthByPrefix2  *[65536]uint8   // bit L set ⇒ some short token of length L starts with these 2 LE bytes
-	longBits2        *[1024]uint64   // bit set ⇒ some long token starts with these 2 LE bytes (65536-bit set)
-	dictionary       []byte          // Suffix storage for long patterns
-	onPair16         bool
-	bucketSizeLimit  int
+	longMatchBuckets   longBucketTable // 8-byte prefix → candidate bucket with suffix-length order
+	shortMatchLookup   [9]u64U16Table  // length → (prefix, token ID)
+	lengthByPrefix2    *[65536]uint8   // bit L set ⇒ some short token of length L starts with these 2 LE bytes
+	longBits2          *[1024]uint64   // bit set ⇒ some long token starts with these 2 LE bytes (65536-bit set)
+	dictionary         []byte          // Suffix storage for long patterns
+	pendingLongBuckets []*longBucket   // buckets that became multi-entry during training
+	onPair16           bool
+	bucketSizeLimit    int
 }
 
 // longBucket is a struct-of-arrays layout with append-only entry storage.
 // heads + suffixLens are the hot arrays touched on every probe (reject path);
 // ids + dictStarts are cold, read only when the packed head matches and the
-// suffix exceeds 8 bytes. order is finalized to greedy longest-first order
-// after training, without moving all four payload arrays for each insertion.
+// suffix exceeds 8 bytes. Multi-entry buckets receive a greedy longest-first
+// index once training is complete, without moving all four payload arrays for
+// each insertion.
 type longBucket struct {
 	heads      []uint64 // first min(suffixLen, 8) bytes of suffix, LE, zero-extended
 	suffixLens []uint16 // bytes past the 8-byte prefix; token length = suffixLen + 8
 	ids        []uint16
 	dictStarts []uint32 // offset in m.dictionary where this suffix starts
-	order      []uint32 // entry indexes, sorted by descending suffix length when ordered
-	ordered    bool
+	order      []uint32 // entry indexes, sorted by descending suffix length after training
 }
 
 func (b *longBucket) len() int { return len(b.heads) }
 
 func (b *longBucket) appendEntry(head uint64, suffixLen uint16, id uint16, dictStart uint32) {
-	entryIndex := uint32(len(b.heads))
 	b.heads = append(b.heads, head)
 	b.suffixLens = append(b.suffixLens, suffixLen)
 	b.ids = append(b.ids, id)
 	b.dictStarts = append(b.dictStarts, dictStart)
-
-	b.order = append(b.order, entryIndex)
-	b.ordered = false
 }
 
 func (b *longBucket) sortBySuffixLen() {
-	if b.ordered {
-		return
+	b.order = make([]uint32, len(b.heads))
+	for i := range b.order {
+		b.order[i] = uint32(i)
 	}
 	sort.SliceStable(b.order, func(i, j int) bool {
 		return b.suffixLens[b.order[i]] > b.suffixLens[b.order[j]]
 	})
-	b.ordered = true
 }
 
 func (m *matcher) finalizeLongBuckets() {
-	for i := range m.longMatchBuckets.entries {
-		bucket := m.longMatchBuckets.entries[i].bucket
-		if bucket != nil {
-			bucket.sortBySuffixLen()
-		}
+	for _, bucket := range m.pendingLongBuckets {
+		bucket.sortBySuffixLen()
 	}
+	m.pendingLongBuckets = nil
 }
 
 // newMatcher creates a new empty longest prefix matcher.
@@ -143,6 +138,9 @@ func (m *matcher) insert(entry []byte, id uint16) bool {
 
 		m.dictionary = append(m.dictionary, suffix...)
 		bucket.appendEntry(head, uint16(suffixLen), id, dictStart)
+		if bucket.len() == 2 {
+			m.pendingLongBuckets = append(m.pendingLongBuckets, bucket)
+		}
 
 		if m.longBits2 == nil {
 			m.longBits2 = new([1024]uint64)
@@ -231,7 +229,7 @@ func (m *matcher) find(data []byte) (uint16, int, bool) {
 			inputHead := bytesToU64LE(inputSuffix, inputHeadLen)
 
 			if bucket := m.longMatchBuckets.get(low8); bucket != nil {
-				if !bucket.ordered {
+				if bucket.order == nil {
 					if id, length, ok := m.findUnorderedLong(bucket, inputSuffix, inputHead); ok {
 						return id, length, true
 					}
