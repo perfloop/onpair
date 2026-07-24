@@ -3,6 +3,7 @@ package onpair
 import (
 	"bytes"
 	"encoding/binary"
+	"hash/maphash"
 	"math"
 	"math/bits"
 	"unsafe"
@@ -82,9 +83,20 @@ func suffixHeadLen(suffixLen uint16) int {
 	return headLen
 }
 
+// longBucketGroupSeed is process-random so callers cannot precompute a
+// collision cluster from public suffix bytes. It is made once rather than on
+// the hot lookup path; group hashing below remains a few integer operations.
+var longBucketGroupSeed = func() uint64 {
+	var hash maphash.Hash
+	hash.SetSeed(maphash.MakeSeed())
+	hash.WriteString("github.com/seiflotfy/onpair/longBucketGroup")
+	return hash.Sum64()
+}()
+
 func longBucketGroupHash(head uint64, headLen int) uint64 {
-	// The suffix head is attacker supplied, so mix both the packed bytes and
-	// length class before probing the open-addressed group table.
+	// The suffix head is caller supplied, so key both it and its length class
+	// before probing the open-addressed group table.
+	head ^= longBucketGroupSeed
 	head ^= uint64(headLen) * 0x9e3779b97f4a7c15
 	head ^= head >> 30
 	head *= 0xbf58476d1ce4e5b9
