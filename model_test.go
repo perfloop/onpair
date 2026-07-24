@@ -2,6 +2,7 @@ package onpair
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -37,6 +38,212 @@ func TestModelTrainEncode(t *testing.T) {
 			t.Fatalf("row %d mismatch: got %q want %q", i, got, want)
 		}
 	}
+}
+
+func TestModelOnPair16SharedPrefixGreedyRoundTrip(t *testing.T) {
+	baseRows := []string{
+		"abcdefghA",
+		"abcdefghABC",
+		"abcdefghABCD",
+		"abcdefghABCE",
+		"abcdefghABCDEFGH",
+		"abcdefghZ",
+	}
+	trainingRows := make([]string, 0, len(baseRows)*16)
+	for _, row := range baseRows {
+		for range 16 {
+			trainingRows = append(trainingRows, row)
+		}
+	}
+
+	model, err := TrainModel(trainingRows, WithThreshold(2), WithMaxTokenLength(16))
+	if err != nil {
+		t.Fatalf("TrainModel: %v", err)
+	}
+	bucket := model.matcher.longMatchBuckets.get(bytesToU64LE([]byte("abcdefgh"), minMatch))
+	if bucket == nil || bucket.len() < len(baseRows) {
+		got := 0
+		if bucket != nil {
+			got = bucket.len()
+		}
+		t.Fatalf("trained OnPair16 shared-prefix bucket: got %d entries, want at least %d", got, len(baseRows))
+	}
+
+	probes := []struct {
+		row        string
+		wantPrefix string
+	}{
+		{"abcdefghABCDEFGH/next", "abcdefghABCDEFGH"},
+		{"abcdefghABCE/next", "abcdefghABCE"},
+		{"abcdefghABCD/next", "abcdefghABCD"},
+		{"abcdefghABC/next", "abcdefghABC"},
+		{"abcdefghABCF/next", "abcdefghABC"}, // reject longer ABCD/ABCE and fall back greedily
+		{"abcdefghA/next", "abcdefghA"},
+	}
+	rows := make([]string, len(probes))
+	for i, probe := range probes {
+		rows[i] = probe.row
+	}
+	archive, err := model.Encode(rows)
+	if err != nil {
+		t.Fatalf("Model.Encode: %v", err)
+	}
+	for i, probe := range probes {
+		got, err := archive.AppendRow(nil, i)
+		if err != nil {
+			t.Fatalf("AppendRow(%d): %v", i, err)
+		}
+		if string(got) != probe.row {
+			t.Fatalf("round trip row %d: got %q want %q", i, got, probe.row)
+		}
+		start := archive.StringBoundaries[i]
+		id := archive.CompressedData[start]
+		first := model.tokenBoundaries[id]
+		last := model.tokenBoundaries[id+1]
+		if gotPrefix := string(model.dictionary[first:last]); gotPrefix != probe.wantPrefix {
+			t.Fatalf("row %d first greedy token: got %q want %q", i, gotPrefix, probe.wantPrefix)
+		}
+	}
+}
+
+const (
+	modelSharedKeyPrefix = "abcdefgh"
+	modelSharedKeyHead   = "ABCDEFGHIJKLMNOP"
+	modelSharedKeyTail   = "xy"
+)
+
+func modelSharedKeyRows(variants int) []string {
+	rows := make([]string, 0, variants*4)
+	for i := 0; i < variants; i++ {
+		row := fmt.Sprintf("%s%s%04x%s", modelSharedKeyPrefix, modelSharedKeyHead, i, modelSharedKeyTail)
+		rows = append(rows, row, row, row, row)
+	}
+	return rows
+}
+
+func reverseModelSharedKeyDiscovery(rows []string) []string {
+	desired := append([]string(nil), rows...)
+	for i, j := 0, len(desired)-1; i < j; i, j = i+1, j-1 {
+		desired[i], desired[j] = desired[j], desired[i]
+	}
+	indices := make([]int, len(rows))
+	for i := range indices {
+		indices[i] = i
+	}
+	state := uint64(42)
+	for i := len(indices) - 1; i > 0; i-- {
+		state = state*6364136223846793005 + 1442695040888963407
+		j := int(state % uint64(i+1))
+		indices[i], indices[j] = indices[j], indices[i]
+	}
+	ordered := make([]string, len(rows))
+	for i, rowIndex := range indices {
+		ordered[rowIndex] = desired[i]
+	}
+	return ordered
+}
+
+func trainModelSharedKeyFixture(tb testing.TB, variants int, reverse bool, sampleBytes int) (*Model, []string) {
+	tb.Helper()
+	rows := modelSharedKeyRows(variants)
+	if reverse {
+		rows = reverseModelSharedKeyDiscovery(rows)
+	}
+	for i, row := range rows {
+		if len(row) != 30 || row[:minMatch] != modelSharedKeyPrefix || row[minMatch:minMatch+len(modelSharedKeyHead)] != modelSharedKeyHead {
+			tb.Fatalf("row %d does not retain the common 16-byte suffix key", i)
+		}
+	}
+	opts := []Option{WithThreshold(2)}
+	if sampleBytes != 0 {
+		opts = append(opts, WithTrainingSampleBytes(sampleBytes))
+	}
+	model, err := TrainModel(rows, opts...)
+	if err != nil {
+		tb.Fatalf("TrainModel: %v", err)
+	}
+	bucket := model.matcher.longMatchBuckets.get(bytesToU64LE([]byte(modelSharedKeyPrefix), minMatch))
+	got := 0
+	if bucket != nil {
+		got = bucket.len()
+	}
+	if got < variants {
+		tb.Fatalf("trained shared-key bucket: got %d entries, want at least %d", got, variants)
+	}
+	return model, rows
+}
+
+func TestModelSharedSuffixKeyFixture(t *testing.T) {
+	model, rows := trainModelSharedKeyFixture(t, 273, false, 0)
+	reject := fmt.Sprintf("%s%sffff%s", modelSharedKeyPrefix, modelSharedKeyHead, modelSharedKeyTail)
+	archive, err := model.Encode([]string{rows[0], rows[len(rows)/2], reject})
+	if err != nil {
+		t.Fatalf("Model.Encode: %v", err)
+	}
+	for i, want := range []string{rows[0], rows[len(rows)/2], reject} {
+		got, err := archive.AppendRow(nil, i)
+		if err != nil {
+			t.Fatalf("AppendRow(%d): %v", i, err)
+		}
+		if string(got) != want {
+			t.Fatalf("row %d round trip: got %q want %q", i, got, want)
+		}
+	}
+	if _, matchLen, ok := model.matcher.find([]byte(reject)); !ok || matchLen >= len(reject) {
+		t.Fatalf("rejecting probe should fall back from the full shared-key token: match length %d, found %t", matchLen, ok)
+	}
+}
+
+func benchmarkModelTrainSharedSuffixKeyReverse(b *testing.B, variants, sampleBytes int) {
+	rows := reverseModelSharedKeyDiscovery(modelSharedKeyRows(variants))
+	totalBytes := int64(0)
+	for _, row := range rows {
+		totalBytes += int64(len(row))
+	}
+	opts := []Option{WithThreshold(2)}
+	if sampleBytes != 0 {
+		opts = append(opts, WithTrainingSampleBytes(sampleBytes))
+	}
+	b.ReportAllocs()
+	b.SetBytes(totalBytes)
+	b.ResetTimer()
+	for b.Loop() {
+		model := NewModel(opts...)
+		if err := model.Train(rows); err != nil {
+			b.Fatal(err)
+		}
+		if model == nil {
+			b.Fatal("nil model")
+		}
+	}
+	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*int(totalBytes)), "ns/byte")
+}
+
+func benchmarkModelEncodeSharedSuffixKeyReject(b *testing.B, variants, sampleBytes int) {
+	model, rows := trainModelSharedKeyFixture(b, variants, true, sampleBytes)
+	reject := fmt.Sprintf("%s%sffff%s", modelSharedKeyPrefix, modelSharedKeyHead, modelSharedKeyTail)
+	for i := range rows {
+		rows[i] = reject
+	}
+	archive, err := model.Encode(rows)
+	if err != nil {
+		b.Fatal(err)
+	}
+	want := len(archive.CompressedData)
+	totalBytes := int64(len(reject) * len(rows))
+	b.ReportAllocs()
+	b.SetBytes(totalBytes)
+	b.ResetTimer()
+	for b.Loop() {
+		archive, err := model.Encode(rows)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if len(archive.CompressedData) != want {
+			b.Fatal("compressed token count changed")
+		}
+	}
+	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*int(totalBytes)), "ns/byte")
 }
 
 func TestModelEncodeWithoutTrain(t *testing.T) {
@@ -202,4 +409,28 @@ func BenchmarkModelEncode(b *testing.B) {
 			}
 		})
 	}
+}
+
+func BenchmarkModelTrainSharedSuffixKeyReverseLarge(b *testing.B) {
+	benchmarkModelTrainSharedSuffixKeyReverse(b, 273, 0)
+}
+
+func BenchmarkModelTrainSharedSuffixKeyReverseExpanded(b *testing.B) {
+	benchmarkModelTrainSharedSuffixKeyReverse(b, 8192, 0)
+}
+
+func BenchmarkModelEncodeSharedSuffixKeyRejectLarge(b *testing.B) {
+	benchmarkModelEncodeSharedSuffixKeyReject(b, 273, 0)
+}
+
+func BenchmarkModelEncodeSharedSuffixKeyRejectExpanded(b *testing.B) {
+	benchmarkModelEncodeSharedSuffixKeyReject(b, 8192, 0)
+}
+
+func BenchmarkModelTrainSharedSuffixKeyReverseConfiguredExpanded(b *testing.B) {
+	benchmarkModelTrainSharedSuffixKeyReverse(b, 16384, 2*1024*1024)
+}
+
+func BenchmarkModelEncodeSharedSuffixKeyRejectConfiguredExpanded(b *testing.B) {
+	benchmarkModelEncodeSharedSuffixKeyReject(b, 16384, 2*1024*1024)
 }

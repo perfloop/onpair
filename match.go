@@ -44,12 +44,13 @@ type matcher struct {
 	onPair16         bool
 	bucketSizeLimit  int
 	groupSeed        uint64
+	groupSeedSet     bool
 }
 
 // longBucket keeps small buckets ordered in place. Larger default buckets use
-// an open-addressed key index. The key includes up to two suffix-head windows
-// so a large group with one first head does not turn every lookup into a tail
-// scan.
+// an open-addressed full-suffix index. Indexed lookup tries the populated
+// suffix lengths in descending order, preserving longest-prefix semantics
+// without letting equal-length shared heads become a tail scan.
 type longBucket struct {
 	// The bounded pre-index form mirrors the pre-image's hot struct-of-arrays
 	// scan. It is converted once at the fixed default-bucket threshold.
@@ -58,27 +59,28 @@ type longBucket struct {
 	ids        []uint16
 	dictStarts []uint32
 
-	candidates []longBucketCandidate // populated only after the threshold transition
-	previous   []uint16              // prior candidate in the same keyed group, or noLongBucketCandidate
-	groupSlots []uint16              // open-addressed group key → latest candidate slot; zero means empty
-	groupCount int
-	keyLenMask uint32 // bit L set => a group keyed by min(suffixLen, 16) == L exists
+	candidates   []longBucketCandidate // populated only after the threshold transition
+	previous     []uint16              // prior candidate in the same keyed group, or noLongBucketCandidate
+	groupSlots   []uint16              // open-addressed group key → latest candidate slot; zero means empty
+	groupCount   int
+	groupLens    []uint16      // distinct suffix lengths, descending, while sparse
+	groupLenBits *[1024]uint64 // dense suffix-length set after the sparse list becomes costly
 }
 
 const (
-	noLongBucketCandidate            = ^uint16(0)
-	longBucketIndexThreshold         = maxOnPair16BucketSize
-	initialLongBucketGroupSlotCount  = 2 * maxOnPair16BucketSize
-	longBucketGroupLoadNumerator     = 7
-	longBucketGroupLoadDenominator   = 8
-	longBucketGroupGrowthNumerator   = 5
-	longBucketGroupGrowthDenominator = 2
-	longBucketGroupKeyBytes          = 2 * minMatch
+	noLongBucketCandidate                = ^uint16(0)
+	longBucketIndexThreshold             = maxOnPair16BucketSize
+	initialLongBucketGroupSlotCount      = 2 * maxOnPair16BucketSize
+	longBucketGroupLoadNumerator         = 7
+	longBucketGroupLoadDenominator       = 8
+	longBucketGroupGrowthNumerator       = 5
+	longBucketGroupGrowthDenominator     = 2
+	longBucketGroupLengthBitmapThreshold = 64
 )
 
 type longBucketCandidate struct {
 	// key is the packed first suffix head before indexing, then is replaced at
-	// the fixed threshold with a process-keyed two-window group key.
+	// the fixed threshold with a process-keyed hash of the complete suffix.
 	key       uint64
 	dictStart uint32 // offset in m.dictionary where this suffix starts
 	suffixLen uint16 // bytes past the 8-byte prefix
@@ -90,14 +92,6 @@ func (b *longBucket) len() int {
 		return len(b.candidates)
 	}
 	return len(b.heads)
-}
-
-func suffixKeyLen(suffixLen uint16) int {
-	keyLen := int(suffixLen)
-	if keyLen > longBucketGroupKeyBytes {
-		return longBucketGroupKeyBytes
-	}
-	return keyLen
 }
 
 // newLongBucketGroupSeed is made once for each matcher, before the hot
@@ -118,28 +112,22 @@ func mixLongBucketKey(value uint64) uint64 {
 	return value ^ (value >> 31)
 }
 
-// longBucketGroupKey uses the first two suffix-head windows. The full suffix
-// is still checked before returning a match, so an exceptionally rare keyed
-// hash collision can only share a chain, never change matching semantics.
+// longBucketGroupKey hashes the complete suffix with a matcher-local seed.
+// The full suffix is still checked before returning a match, so an exceptionally
+// rare keyed hash collision can only share a chain, never change semantics.
 func longBucketGroupKey(suffix []byte, seed uint64) uint64 {
-	keyLen := len(suffix)
-	if keyLen > longBucketGroupKeyBytes {
-		keyLen = longBucketGroupKeyBytes
+	key := seed ^ uint64(len(suffix))*0x9e3779b97f4a7c15
+	for len(suffix) >= minMatch {
+		key ^= bytesToU64LE(suffix, minMatch)
+		key = bits.RotateLeft64(key, 27) * 0x3c79ac492ba7b653
+		key ^= key >> 29
+		suffix = suffix[minMatch:]
 	}
-	firstLen := keyLen
-	if firstLen > minMatch {
-		firstLen = minMatch
+	if len(suffix) != 0 {
+		key ^= bytesToU64LE(suffix, len(suffix))
+		key = bits.RotateLeft64(key, 27) * 0x3c79ac492ba7b653
 	}
-	// Mix each window with the matcher seed before combining them. Applying the
-	// seed only after an unkeyed XOR would leave an attacker able to manufacture
-	// distinct first/second-window pairs with the same intermediate value.
-	key := mixLongBucketKey(bytesToU64LE(suffix, firstLen) ^ seed)
-	if keyLen > minMatch {
-		tailSeed := bits.RotateLeft64(seed, 17)
-		tail := mixLongBucketKey(bytesToU64LE(suffix[minMatch:], keyLen-minMatch) ^ tailSeed)
-		key ^= bits.RotateLeft64(tail, 23)
-	}
-	return mixLongBucketKey(key ^ uint64(keyLen)*0x9e3779b97f4a7c15)
+	return mixLongBucketKey(key)
 }
 
 func longBucketGroupHash(key uint64, keyLen int) uint64 {
@@ -148,22 +136,11 @@ func longBucketGroupHash(key uint64, keyLen int) uint64 {
 
 func (b *longBucket) appendCandidate(candidate longBucketCandidate) {
 	if len(b.candidates) == cap(b.candidates) {
-		nextCapacity := 0
-		if len(b.candidates) == longBucketIndexThreshold {
-			// The first group table adds two index-threshold windows. Reserve that
-			// same construction window for candidates so it does not immediately
-			// copy again after the index becomes active.
-			nextCapacity = len(b.candidates) + initialLongBucketGroupSlotCount
-		} else if len(b.candidates) >= longBucketIndexThreshold {
-			// Indexed buckets append only; doubling avoids retaining the runtime's
-			// intermediate backing arrays as a large bucket is trained.
-			nextCapacity = cap(b.candidates) * 2
-		}
-		if nextCapacity != 0 {
-			next := make([]longBucketCandidate, len(b.candidates), nextCapacity)
-			copy(next, b.candidates)
-			b.candidates = next
-		}
+		// enableIndexed reserves the first post-transition window. Every later
+		// indexed expansion doubles that append-only backing store.
+		next := make([]longBucketCandidate, len(b.candidates), cap(b.candidates)*2)
+		copy(next, b.candidates)
+		b.candidates = next
 	}
 	b.candidates = append(b.candidates, candidate)
 }
@@ -183,13 +160,45 @@ func (b *longBucket) groupSlot(key uint64, keyLen int) int {
 			return slot
 		}
 		candidate := &b.candidates[entry-1]
-		if suffixKeyLen(candidate.suffixLen) == keyLen && candidate.key == key {
+		if int(candidate.suffixLen) == keyLen && candidate.key == key {
 			return slot
 		}
 		slot++
 		if slot == len(b.groupSlots) {
 			slot = 0
 		}
+	}
+}
+
+func (b *longBucket) addGroupLen(length uint16) {
+	// Normal buckets have few lengths. Promote an attacker-selected dense set
+	// before ordered insertion can become a repeated slice-shift cost.
+	if b.groupLenBits != nil {
+		b.groupLenBits[length>>6] |= uint64(1) << (length & 63)
+		return
+	}
+	lo, hi := 0, len(b.groupLens)
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		if b.groupLens[mid] == length {
+			return
+		}
+		if b.groupLens[mid] > length {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	b.groupLens = append(b.groupLens, 0)
+	copy(b.groupLens[lo+1:], b.groupLens[lo:])
+	b.groupLens[lo] = length
+	if len(b.groupLens) == longBucketGroupLengthBitmapThreshold {
+		lengths := new([1024]uint64)
+		for _, groupLen := range b.groupLens {
+			lengths[groupLen>>6] |= uint64(1) << (groupLen & 63)
+		}
+		b.groupLenBits = lengths
+		b.groupLens = nil
 	}
 }
 
@@ -206,13 +215,14 @@ func (b *longBucket) enablePrevious() {
 func (b *longBucket) buildGroupSlots(dictionary []byte, seed uint64) {
 	b.groupSlots = make([]uint16, initialLongBucketGroupSlotCount)
 	b.groupCount = 0
-	b.keyLenMask = 0
+	b.groupLens = nil
+	b.groupLenBits = nil
 	for i := range b.candidates {
 		candidate := &b.candidates[i]
 		start := int(candidate.dictStart)
 		end := start + int(candidate.suffixLen)
 		candidate.key = longBucketGroupKey(dictionary[start:end], seed)
-		keyLen := suffixKeyLen(candidate.suffixLen)
+		keyLen := int(candidate.suffixLen)
 		slot := b.groupSlot(candidate.key, keyLen)
 		previous := b.groupSlots[slot]
 		if previous != 0 {
@@ -222,7 +232,7 @@ func (b *longBucket) buildGroupSlots(dictionary []byte, seed uint64) {
 			b.groupCount++
 		}
 		b.groupSlots[slot] = uint16(i + 1)
-		b.keyLenMask |= 1 << uint(keyLen)
+		b.addGroupLen(candidate.suffixLen)
 	}
 }
 
@@ -234,8 +244,7 @@ func (b *longBucket) growGroupSlots() {
 	b.groupSlots = make([]uint16, newSlotCount)
 	for i := range b.candidates {
 		candidate := &b.candidates[i]
-		keyLen := suffixKeyLen(candidate.suffixLen)
-		slot := b.groupSlot(candidate.key, keyLen)
+		slot := b.groupSlot(candidate.key, int(candidate.suffixLen))
 		b.groupSlots[slot] = uint16(i + 1)
 	}
 }
@@ -288,7 +297,7 @@ func (b *longBucket) appendEntry(suffix []byte, suffixLen uint16, id uint16, dic
 		return
 	}
 
-	keyLen := suffixKeyLen(suffixLen)
+	keyLen := int(suffixLen)
 	candidate := longBucketCandidate{
 		key:       longBucketGroupKey(suffix, seed),
 		dictStart: dictStart,
@@ -309,7 +318,7 @@ func (b *longBucket) appendEntry(suffix []byte, suffixLen uint16, id uint16, dic
 	if b.previous != nil {
 		b.previous = append(b.previous, noLongBucketCandidate)
 	}
-	b.keyLenMask |= 1 << uint(keyLen)
+	b.addGroupLen(suffixLen)
 
 	previous := b.groupSlots[slot]
 	if previous != 0 {
@@ -329,6 +338,14 @@ func (b *longBucket) lookupGroupEnd(key uint64, keyLen int) int {
 	return -1
 }
 
+func (m *matcher) indexedGroupSeed() uint64 {
+	if !m.groupSeedSet {
+		m.groupSeed = newLongBucketGroupSeed()
+		m.groupSeedSet = true
+	}
+	return m.groupSeed
+}
+
 // newMatcher creates a new empty longest prefix matcher.
 func newMatcher(maxTokenLen int) *matcher {
 	onPair16 := maxTokenLen == 16
@@ -341,7 +358,6 @@ func newMatcher(maxTokenLen int) *matcher {
 		endPositions:    []uint32{0},
 		onPair16:        onPair16,
 		bucketSizeLimit: bucketSizeLimit,
-		groupSeed:       newLongBucketGroupSeed(),
 	}
 }
 
@@ -379,7 +395,12 @@ func (m *matcher) insert(entry []byte, id uint16) bool {
 
 		m.dictionary = append(m.dictionary, suffix...)
 		m.endPositions = append(m.endPositions, uint32(len(m.dictionary)))
-		bucket.appendEntry(suffix, uint16(suffixLen), id, dictStart, m.dictionary, m.groupSeed, m.bucketSizeLimit == 0)
+		indexEnabled := m.bucketSizeLimit == 0
+		seed := uint64(0)
+		if indexEnabled && (bucket.candidates != nil || bucket.len()+1 == longBucketIndexThreshold) {
+			seed = m.indexedGroupSeed()
+		}
+		bucket.appendEntry(suffix, uint16(suffixLen), id, dictStart, m.dictionary, seed, indexEnabled)
 
 		if m.longBits2 == nil {
 			m.longBits2 = new([1024]uint64)
@@ -461,40 +482,53 @@ func (m *matcher) find(data []byte) (uint16, int, bool) {
 						}
 					}
 				} else {
-					inputKeyLen := len(inputSuffix)
-					if inputKeyLen > longBucketGroupKeyBytes {
-						inputKeyLen = longBucketGroupKeyBytes
-					}
-					matchingKeyLens := bucket.keyLenMask
-					matchingKeyLens &= (uint32(1) << uint(inputKeyLen+1)) - 1
-					for matchingKeyLens != 0 {
-						keyLen := bits.Len32(matchingKeyLens) - 1
-						key := longBucketGroupKey(inputSuffix[:keyLen], m.groupSeed)
-						candidateEnd := bucket.lookupGroupEnd(key, keyLen)
-						if candidateEnd >= 0 {
-							bestLen := -1
-							var bestID uint16
-							for i := candidateEnd; i != int(noLongBucketCandidate); {
-								candidate := &bucket.candidates[i]
-								sLen := int(candidate.suffixLen)
-								if sLen <= len(inputSuffix) {
-									start := int(candidate.dictStart)
-									if bytes.Equal(m.dictionary[start:start+sLen], inputSuffix[:sLen]) &&
-										(sLen > bestLen || (sLen == bestLen && candidate.id < bestID)) {
-										bestLen = sLen
-										bestID = candidate.id
-									}
-								}
-								if bucket.previous == nil {
-									break
-								}
-								i = int(bucket.previous[i])
+					trySuffixLen := func(sLen int) (uint16, bool) {
+						if sLen > len(inputSuffix) {
+							return 0, false
+						}
+						key := longBucketGroupKey(inputSuffix[:sLen], m.groupSeed)
+						candidateEnd := bucket.lookupGroupEnd(key, sLen)
+						if candidateEnd < 0 {
+							return 0, false
+						}
+						bestID := uint16(0)
+						matched := false
+						for i := candidateEnd; i != int(noLongBucketCandidate); {
+							candidate := &bucket.candidates[i]
+							start := int(candidate.dictStart)
+							if bytes.Equal(m.dictionary[start:start+sLen], inputSuffix[:sLen]) &&
+								(!matched || candidate.id < bestID) {
+								bestID = candidate.id
+								matched = true
 							}
-							if bestLen >= 0 {
-								return bestID, minMatch + bestLen, true
+							if bucket.previous == nil {
+								break
+							}
+							i = int(bucket.previous[i])
+						}
+						return bestID, matched
+					}
+					if bucket.groupLenBits != nil {
+						maxWord := len(inputSuffix) >> 6
+						if maxWord >= len(bucket.groupLenBits) {
+							maxWord = len(bucket.groupLenBits) - 1
+						}
+						for wordIndex := maxWord; wordIndex >= 0; wordIndex-- {
+							word := bucket.groupLenBits[wordIndex]
+							for word != 0 {
+								bit := bits.Len64(word) - 1
+								word &^= uint64(1) << bit
+								if id, ok := trySuffixLen(wordIndex*64 + bit); ok {
+									return id, minMatch + wordIndex*64 + bit, true
+								}
 							}
 						}
-						matchingKeyLens &^= 1 << uint(keyLen)
+					} else {
+						for _, suffixLen := range bucket.groupLens {
+							if id, ok := trySuffixLen(int(suffixLen)); ok {
+								return id, minMatch + int(suffixLen), true
+							}
+						}
 					}
 				}
 			}

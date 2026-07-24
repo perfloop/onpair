@@ -163,3 +163,26 @@ func TestLongBucketIndexedGroupsMatchReference(t *testing.T) {
 		}
 	}
 }
+
+func TestLongBucketDenseLengthIndex(t *testing.T) {
+	m := newMatcher(0)
+	prefix := []byte("abcdefgh")
+	entries := make([][]byte, longBucketIndexThreshold)
+	for i := range entries {
+		suffix := bytes.Repeat([]byte{byte(i)}, 1+i%longBucketGroupLengthBitmapThreshold)
+		entries[i] = append(append([]byte(nil), prefix...), suffix...)
+		if !m.insert(entries[i], uint16(i)) {
+			t.Fatalf("insert %d failed", i)
+		}
+	}
+	bucket := m.longMatchBuckets.get(bytesToU64LE(prefix, minMatch))
+	if bucket.groupLenBits == nil || bucket.groupLens != nil {
+		t.Fatal("expected dense suffix-length index after 64 distinct lengths")
+	}
+	for i, entry := range entries {
+		id, n, ok := m.find(entry)
+		if !ok || id != uint16(i) || n != len(entry) {
+			t.Fatalf("find %d: id=%d length=%d found=%t", i, id, n, ok)
+		}
+	}
+}
