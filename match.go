@@ -44,32 +44,72 @@ type matcher struct {
 	bucketSizeLimit  int
 }
 
-// longBucket is a struct-of-arrays layout. heads + suffixLens are the hot
-// arrays touched on every probe (reject path); ids + dictStarts are cold,
-// read only when the packed head matches and the suffix exceeds 8 bytes.
-// Keeping them in parallel slices cuts the reject-path working set from
-// 16 B/entry (the equivalent AoS struct) to 10 B/entry.
+// longBucket groups suffixes by the bytes that find uses for its packed-head
+// prefilter. Groups share candidate storage, and each group links its entries
+// in descending suffix-length order so lookup still preserves greedy matching.
 type longBucket struct {
-	heads      []uint64 // first min(suffixLen, 8) bytes of suffix, LE, zero-extended
-	suffixLens []uint16 // bytes past the 8-byte prefix; token length = suffixLen + 8
-	ids        []uint16
-	dictStarts []uint32 // offset in m.dictionary where this suffix starts
+	groupsByHead map[longBucketGroupKey]uint32 // group slot + 1; zero means absent
+	groups       []longBucketGroup
+	candidates   []longBucketCandidate
+	headLenMask  uint16 // bit L set => a group with min(suffixLen, 8) == L exists
 }
 
-func (b *longBucket) len() int { return len(b.heads) }
+type longBucketGroupKey struct {
+	head    uint64
+	headLen uint8
+}
+
+type longBucketGroup struct {
+	first uint32 // candidate slot + 1; zero means empty
+}
+
+type longBucketCandidate struct {
+	suffixLen uint16 // bytes past the 8-byte prefix
+	id        uint16
+	dictStart uint32 // offset in m.dictionary where this suffix starts
+	next      uint32 // candidate slot + 1; zero means end
+}
+
+func (b *longBucket) len() int { return len(b.candidates) }
 
 func (b *longBucket) appendEntry(head uint64, suffixLen uint16, id uint16, dictStart uint32) {
-	b.heads = append(b.heads, head)
-	b.suffixLens = append(b.suffixLens, suffixLen)
-	b.ids = append(b.ids, id)
-	b.dictStarts = append(b.dictStarts, dictStart)
+	headLen := int(suffixLen)
+	if headLen > minMatch {
+		headLen = minMatch
+	}
+	key := longBucketGroupKey{head: head & masks[headLen], headLen: uint8(headLen)}
+	if b.groupsByHead == nil {
+		b.groupsByHead = make(map[longBucketGroupKey]uint32)
+	}
+	groupSlot := b.groupsByHead[key]
+	if groupSlot == 0 {
+		b.groups = append(b.groups, longBucketGroup{})
+		groupSlot = uint32(len(b.groups))
+		b.groupsByHead[key] = groupSlot
+	}
+
+	candidateSlot := uint32(len(b.candidates) + 1)
+	b.candidates = append(b.candidates, longBucketCandidate{
+		suffixLen: suffixLen,
+		id:        id,
+		dictStart: dictStart,
+	})
+	group := &b.groups[groupSlot-1]
+	link := &group.first
+	for *link != 0 && b.candidates[*link-1].suffixLen >= suffixLen {
+		link = &b.candidates[*link-1].next
+	}
+	b.candidates[candidateSlot-1].next = *link
+	*link = candidateSlot
+	b.headLenMask |= 1 << uint(headLen)
 }
 
-func (b *longBucket) swap(i, j int) {
-	b.heads[i], b.heads[j] = b.heads[j], b.heads[i]
-	b.suffixLens[i], b.suffixLens[j] = b.suffixLens[j], b.suffixLens[i]
-	b.ids[i], b.ids[j] = b.ids[j], b.ids[i]
-	b.dictStarts[i], b.dictStarts[j] = b.dictStarts[j], b.dictStarts[i]
+func (b *longBucket) lookupGroup(head uint64, headLen int) *longBucketGroup {
+	groupSlot := b.groupsByHead[longBucketGroupKey{head: head & masks[headLen], headLen: uint8(headLen)}]
+	if groupSlot == 0 {
+		return nil
+	}
+	return &b.groups[groupSlot-1]
 }
 
 // newMatcher creates a new empty longest prefix matcher.
@@ -134,15 +174,6 @@ func (m *matcher) insert(entry []byte, id uint16) bool {
 		p2 := uint16(prefix)
 		m.longBits2[p2>>6] |= 1 << (p2 & 63)
 
-		// Sort by suffix length (longest first) for greedy matching.
-		// Insertion sort as we add one at a time.
-		for i := bucket.len() - 1; i > 0; i-- {
-			if bucket.suffixLens[i] > bucket.suffixLens[i-1] {
-				bucket.swap(i, i-1)
-			} else {
-				break
-			}
-		}
 	} else {
 		// Single-byte tokens are always byte-value identity tokens.
 		if len(entry) == 1 {
@@ -192,31 +223,30 @@ func (m *matcher) find(data []byte) (uint16, int, bool) {
 			inputHead := bytesToU64LE(inputSuffix, inputHeadLen)
 
 			if bucket := m.longMatchBuckets.get(low8); bucket != nil {
-				heads := bucket.heads
-				lens := bucket.suffixLens
-				for i := 0; i < len(heads); i++ {
-					sLen := int(lens[i])
-					if sLen > len(inputSuffix) {
-						continue
+				matchingHeadLens := bucket.headLenMask
+				matchingHeadLens &= (1 << (uint(inputHeadLen) + 1)) - 1
+				for matchingHeadLens != 0 {
+					headLen := bits.Len16(matchingHeadLens) - 1
+					group := bucket.lookupGroup(inputHead, headLen)
+					if group != nil {
+						for candidateSlot := group.first; candidateSlot != 0; {
+							candidate := &bucket.candidates[candidateSlot-1]
+							candidateSlot = candidate.next
+							sLen := int(candidate.suffixLen)
+							if sLen > len(inputSuffix) {
+								continue
+							}
+							if sLen <= minMatch {
+								return candidate.id, minMatch + sLen, true
+							}
+							// Suffix longer than 8 bytes: verify the tail past the head.
+							start := int(candidate.dictStart)
+							if bytes.Equal(m.dictionary[start+minMatch:start+sLen], inputSuffix[minMatch:sLen]) {
+								return candidate.id, minMatch + sLen, true
+							}
+						}
 					}
-					// Packed head prefilter: XOR the stored head with the input's
-					// head masked to the relevant length. For suffixes ≤ 8 bytes
-					// this is authoritative; otherwise it's a cheap reject.
-					mLen := sLen
-					if mLen > minMatch {
-						mLen = minMatch
-					}
-					if (heads[i]^inputHead)&masks[mLen] != 0 {
-						continue
-					}
-					if sLen <= minMatch {
-						return bucket.ids[i], minMatch + sLen, true
-					}
-					// Suffix longer than 8 bytes: verify the tail past the head.
-					start := int(bucket.dictStarts[i])
-					if bytes.Equal(m.dictionary[start+minMatch:start+sLen], inputSuffix[minMatch:sLen]) {
-						return bucket.ids[i], minMatch + sLen, true
-					}
+					matchingHeadLens &^= 1 << uint(headLen)
 				}
 			}
 		}
