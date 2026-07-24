@@ -35,14 +35,13 @@ const (
 // skips the table probe entirely when no stored pattern starts with those
 // bytes.
 type matcher struct {
-	longMatchBuckets     longBucketTable // 8-byte prefix → candidate bucket
-	shortMatchLookup     [9]u64U16Table  // length → (prefix, token ID)
-	lengthByPrefix2      *[65536]uint8   // bit L set ⇒ some short token of length L starts with these 2 LE bytes
-	longBits2            *[1024]uint64   // bit set ⇒ some long token starts with these 2 LE bytes (65536-bit set)
-	dictionary           []byte          // Suffix storage for long patterns
-	onPair16             bool
-	longBucketsFinalized bool // all long buckets have greedy longest-first payload order
-	bucketSizeLimit      int
+	longMatchBuckets longBucketTable // 8-byte prefix → candidate bucket
+	shortMatchLookup [9]u64U16Table  // length → (prefix, token ID)
+	lengthByPrefix2  *[65536]uint8   // bit L set ⇒ some short token of length L starts with these 2 LE bytes
+	longBits2        *[1024]uint64   // bit set ⇒ some long token starts with these 2 LE bytes (65536-bit set)
+	dictionary       []byte          // Suffix storage for long patterns
+	onPair16         bool
+	bucketSizeLimit  int
 }
 
 // longBucket is a struct-of-arrays layout with append-only entry storage.
@@ -67,7 +66,27 @@ func (b *longBucket) appendEntry(head uint64, suffixLen uint16, id uint16, dictS
 }
 
 func (b *longBucket) sortBySuffixLen() {
-	if len(b.heads) < 2 {
+	switch len(b.heads) {
+	case 0, 1:
+		return
+	case 2:
+		if b.suffixLens[1] > b.suffixLens[0] {
+			b.heads[0], b.heads[1] = b.heads[1], b.heads[0]
+			b.suffixLens[0], b.suffixLens[1] = b.suffixLens[1], b.suffixLens[0]
+			b.ids[0], b.ids[1] = b.ids[1], b.ids[0]
+			b.dictStarts[0], b.dictStarts[1] = b.dictStarts[1], b.dictStarts[0]
+		}
+		return
+	}
+
+	needsReorder := false
+	for i := 1; i < len(b.suffixLens); i++ {
+		if b.suffixLens[i] > b.suffixLens[i-1] {
+			needsReorder = true
+			break
+		}
+	}
+	if !needsReorder {
 		return
 	}
 
@@ -120,7 +139,6 @@ func (m *matcher) finalizeLongBuckets() {
 			bucket.sortBySuffixLen()
 		}
 	}
-	m.longBucketsFinalized = true
 }
 
 // newMatcher creates a new empty longest prefix matcher.
@@ -176,7 +194,6 @@ func (m *matcher) insert(entry []byte, id uint16) bool {
 
 		m.dictionary = append(m.dictionary, suffix...)
 		bucket.appendEntry(head, uint16(suffixLen), id, dictStart)
-		m.longBucketsFinalized = false
 
 		if m.longBits2 == nil {
 			m.longBits2 = new([1024]uint64)
@@ -237,74 +254,8 @@ func (m *matcher) findUnorderedLong(bucket *longBucket, inputSuffix []byte, inpu
 	return bucket.ids[bestIndex], minMatch + bestSuffixLen, true
 }
 
-// find finds the longest matching pattern for the given input data.
-//
-// Returns the token ID and match length for the longest pattern that matches
-// the beginning of the input data. Uses two-phase search:
-//
-// 1. Long pattern search: Check bucketed patterns (>8 bytes) first for longest matches
-// 2. Short pattern search: Check direct lookup patterns (≤8 bytes) in decreasing length order
-func (m *matcher) find(data []byte) (uint16, int, bool) {
-	// The first up-to-8 bytes serve as both the long-bucket prefix key and the
-	// short-lookup probe window, so load them once.
-	maxLen := minMatch
-	if len(data) < maxLen {
-		maxLen = len(data)
-	}
-	low8 := bytesToU64LE(data, maxLen)
-
-	// Phase 1: Long pattern search (>8 bytes) - check longest matches first.
-	// Gate table access behind a 2-byte-prefix bitset so non-matching inputs
-	// skip the table probe entirely.
-	if len(data) > minMatch && m.longBits2 != nil {
-		p2 := uint16(low8)
-		if m.longBits2[p2>>6]&(1<<(p2&63)) != 0 {
-			inputSuffix := data[minMatch:]
-			inputHeadLen := len(inputSuffix)
-			if inputHeadLen > minMatch {
-				inputHeadLen = minMatch
-			}
-			inputHead := bytesToU64LE(inputSuffix, inputHeadLen)
-
-			if bucket := m.longMatchBuckets.get(low8); bucket != nil {
-				if !m.longBucketsFinalized {
-					if id, length, ok := m.findUnorderedLong(bucket, inputSuffix, inputHead); ok {
-						return id, length, true
-					}
-				} else {
-					heads := bucket.heads
-					lens := bucket.suffixLens
-					for i := range heads {
-						sLen := int(lens[i])
-						if sLen > len(inputSuffix) {
-							continue
-						}
-						// Packed head prefilter: XOR the stored head with the input's
-						// head masked to the relevant length. For suffixes ≤ 8 bytes
-						// this is authoritative; otherwise it's a cheap reject.
-						mLen := sLen
-						if mLen > minMatch {
-							mLen = minMatch
-						}
-						if (heads[i]^inputHead)&masks[mLen] != 0 {
-							continue
-						}
-						if sLen <= minMatch {
-							return bucket.ids[i], minMatch + sLen, true
-						}
-						// Suffix longer than 8 bytes: verify the tail past the head.
-						start := int(bucket.dictStarts[i])
-						if bytes.Equal(m.dictionary[start+minMatch:start+sLen], inputSuffix[minMatch:sLen]) {
-							return bucket.ids[i], minMatch + sLen, true
-						}
-					}
-				}
-			}
-		}
-	}
-
-	// Phase 2: Short pattern search (≤8 bytes) - longest to shortest.
-	// Use 2-byte-prefix bitmask to skip lengths with no candidates.
+// findShort finds the longest direct-table pattern or falls back to a byte.
+func (m *matcher) findShort(data []byte, maxLen int, low8 uint64) (uint16, int, bool) {
 	if maxLen >= 2 && m.lengthByPrefix2 != nil {
 		lenMask := m.lengthByPrefix2[uint16(low8)]
 		// Drop bits for lengths > maxLen. maxLen ≤ 8 so mask fits in uint8.
@@ -320,8 +271,106 @@ func (m *matcher) find(data []byte) (uint16, int, bool) {
 	if len(data) > 0 {
 		return uint16(data[0]), 1, true
 	}
-
 	return 0, 0, false
+}
+
+// find finds the longest matching pattern for a finalized matcher. Its long
+// buckets are contiguous longest-first payload arrays, so the Encode path can
+// traverse them directly without a training-state branch.
+func (m *matcher) find(data []byte) (uint16, int, bool) {
+	maxLen := minMatch
+	if len(data) < maxLen {
+		maxLen = len(data)
+	}
+	low8 := bytesToU64LE(data, maxLen)
+
+	if len(data) > minMatch && m.longBits2 != nil {
+		p2 := uint16(low8)
+		if m.longBits2[p2>>6]&(1<<(p2&63)) != 0 {
+			inputSuffix := data[minMatch:]
+			inputHeadLen := len(inputSuffix)
+			if inputHeadLen > minMatch {
+				inputHeadLen = minMatch
+			}
+			inputHead := bytesToU64LE(inputSuffix, inputHeadLen)
+
+			if bucket := m.longMatchBuckets.get(low8); bucket != nil {
+				heads := bucket.heads
+				lens := bucket.suffixLens
+				for i := range heads {
+					sLen := int(lens[i])
+					if sLen > len(inputSuffix) {
+						continue
+					}
+					// Packed head prefilter: XOR the stored head with the input's
+					// head masked to the relevant length. For suffixes ≤ 8 bytes
+					// this is authoritative; otherwise it's a cheap reject.
+					mLen := sLen
+					if mLen > minMatch {
+						mLen = minMatch
+					}
+					if (heads[i]^inputHead)&masks[mLen] != 0 {
+						continue
+					}
+					if sLen <= minMatch {
+						return bucket.ids[i], minMatch + sLen, true
+					}
+					// Suffix longer than 8 bytes: verify the tail past the head.
+					start := int(bucket.dictStarts[i])
+					if bytes.Equal(m.dictionary[start+minMatch:start+sLen], inputSuffix[minMatch:sLen]) {
+						return bucket.ids[i], minMatch + sLen, true
+					}
+				}
+			}
+		}
+	}
+
+	// Phase 2: short patterns (≤8 bytes), longest first. Keep this direct in
+	// the finalized parser path; buildTokens alone uses findShort below.
+	if maxLen >= 2 && m.lengthByPrefix2 != nil {
+		lenMask := m.lengthByPrefix2[uint16(low8)]
+		lenMask &= (1 << (uint(maxLen) + 1)) - 1
+		for lenMask != 0 {
+			length := bits.Len8(lenMask) - 1
+			if id, ok := m.shortMatchLookup[length].get(low8 & masks[length]); ok {
+				return id, length, true
+			}
+			lenMask &^= 1 << length
+		}
+	}
+	if len(data) > 0 {
+		return uint16(data[0]), 1, true
+	}
+	return 0, 0, false
+}
+
+// findUnordered finds the longest matching pattern while buildTokens is still
+// appending long-bucket entries. Encoder.train finalizes those arrays before
+// the matcher reaches the Encode path.
+func (m *matcher) findUnordered(data []byte) (uint16, int, bool) {
+	maxLen := minMatch
+	if len(data) < maxLen {
+		maxLen = len(data)
+	}
+	low8 := bytesToU64LE(data, maxLen)
+
+	if len(data) > minMatch && m.longBits2 != nil {
+		p2 := uint16(low8)
+		if m.longBits2[p2>>6]&(1<<(p2&63)) != 0 {
+			inputSuffix := data[minMatch:]
+			inputHeadLen := len(inputSuffix)
+			if inputHeadLen > minMatch {
+				inputHeadLen = minMatch
+			}
+			inputHead := bytesToU64LE(inputSuffix, inputHeadLen)
+			if bucket := m.longMatchBuckets.get(low8); bucket != nil {
+				if id, length, ok := m.findUnorderedLong(bucket, inputSuffix, inputHead); ok {
+					return id, length, true
+				}
+			}
+		}
+	}
+	return m.findShort(data, maxLen, low8)
 }
 
 // bytesToU64LE converts byte sequence to little-endian u64 with length masking.

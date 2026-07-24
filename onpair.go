@@ -520,7 +520,7 @@ func (e *Encoder) buildTokens(
 		}
 		seg := data[start:end]
 
-		prevTokenID, prevLength, ok := matcher.find(seg)
+		prevTokenID, prevLength, ok := matcher.findUnordered(seg)
 		if !ok {
 			continue
 		}
@@ -529,7 +529,7 @@ func (e *Encoder) buildTokens(
 		}
 
 		for pos := prevLength; pos < len(seg); {
-			currTokenID, currLength, ok := matcher.find(seg[pos:])
+			currTokenID, currLength, ok := matcher.findUnordered(seg[pos:])
 			if !ok {
 				break
 			}

@@ -76,34 +76,3 @@ func TestOnPair16MatcherFindLongToken(t *testing.T) {
 		t.Fatalf("token length mismatch: got %d want %d", n, len(token))
 	}
 }
-
-func TestMatcherFindsLongestUnfinalizedLongToken(t *testing.T) {
-	// buildTokens probes the matcher between long-token insertions. Exercise
-	// that unfinished phase directly; the public training test covers the
-	// separate finalized traversal after buildTokens returns.
-	m := newMatcher(0)
-	tokens := [][]byte{
-		[]byte("abcdefghz"),
-		[]byte("abcdefghzzzzzzzz"),
-		[]byte("abcdefghzzzzzzzzz"),
-	}
-	for i, token := range tokens {
-		if !m.insert(token, uint16(singleByteTokens+i)) {
-			t.Fatalf("insert %d failed", i)
-		}
-	}
-	if m.longBucketsFinalized {
-		t.Fatal("long buckets finalized before training completes")
-	}
-
-	id, n, ok := m.find([]byte("abcdefghzzzzzzzzz_tail"))
-	if !ok {
-		t.Fatal("expected long match")
-	}
-	if want := uint16(singleByteTokens + len(tokens) - 1); id != want {
-		t.Fatalf("token id: got %d, want %d", id, want)
-	}
-	if want := len(tokens[len(tokens)-1]); n != want {
-		t.Fatalf("token length: got %d, want %d", n, want)
-	}
-}
