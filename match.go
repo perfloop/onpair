@@ -35,50 +35,78 @@ const (
 // skips the table probe entirely when no stored pattern starts with those
 // bytes.
 type matcher struct {
-	longMatchBuckets longBucketTable // 8-byte prefix → candidate bucket with suffix-length order
-	shortMatchLookup [9]u64U16Table  // length → (prefix, token ID)
-	lengthByPrefix2  *[65536]uint8   // bit L set ⇒ some short token of length L starts with these 2 LE bytes
-	longBits2        *[1024]uint64   // bit set ⇒ some long token starts with these 2 LE bytes (65536-bit set)
-	dictionary       []byte          // Suffix storage for long patterns
-	onPair16         bool
-	bucketSizeLimit  int
+	longMatchBuckets     longBucketTable // 8-byte prefix → candidate bucket
+	shortMatchLookup     [9]u64U16Table  // length → (prefix, token ID)
+	lengthByPrefix2      *[65536]uint8   // bit L set ⇒ some short token of length L starts with these 2 LE bytes
+	longBits2            *[1024]uint64   // bit set ⇒ some long token starts with these 2 LE bytes (65536-bit set)
+	dictionary           []byte          // Suffix storage for long patterns
+	onPair16             bool
+	longBucketsFinalized bool // all long buckets have greedy longest-first payload order
+	bucketSizeLimit      int
 }
 
 // longBucket is a struct-of-arrays layout with append-only entry storage.
 // heads + suffixLens are the hot arrays touched on every probe (reject path);
 // ids + dictStarts are cold, read only when the packed head matches and the
-// suffix exceeds 8 bytes. order is finalized to greedy longest-first order
-// after training, without moving all four payload arrays for each insertion.
+// suffix exceeds 8 bytes. Finalization sorts the payload arrays once after
+// training, so parsing retains direct longest-first traversal.
 type longBucket struct {
 	heads      []uint64 // first min(suffixLen, 8) bytes of suffix, LE, zero-extended
 	suffixLens []uint16 // bytes past the 8-byte prefix; token length = suffixLen + 8
 	ids        []uint16
 	dictStarts []uint32 // offset in m.dictionary where this suffix starts
-	order      []uint32 // entry indexes, sorted by descending suffix length when ordered
-	ordered    bool
 }
 
 func (b *longBucket) len() int { return len(b.heads) }
 
 func (b *longBucket) appendEntry(head uint64, suffixLen uint16, id uint16, dictStart uint32) {
-	entryIndex := uint32(len(b.heads))
 	b.heads = append(b.heads, head)
 	b.suffixLens = append(b.suffixLens, suffixLen)
 	b.ids = append(b.ids, id)
 	b.dictStarts = append(b.dictStarts, dictStart)
-
-	b.order = append(b.order, entryIndex)
-	b.ordered = false
 }
 
 func (b *longBucket) sortBySuffixLen() {
-	if b.ordered {
-		return
+	// Production token IDs are sequential uint16 values, with the first 256
+	// reserved for byte tokens, so a long bucket has at most 65,280 entries.
+	// A uint16 order is therefore sufficient while training is finalized.
+	order := make([]uint16, len(b.heads))
+	for i := range order {
+		order[i] = uint16(i)
 	}
-	sort.SliceStable(b.order, func(i, j int) bool {
-		return b.suffixLens[b.order[i]] > b.suffixLens[b.order[j]]
+	sort.SliceStable(order, func(i, j int) bool {
+		return b.suffixLens[order[i]] > b.suffixLens[order[j]]
 	})
-	b.ordered = true
+
+	// order maps each destination to its source entry. Rotate each cycle in
+	// place so parsing can walk the sorted payload arrays without an index
+	// lookup. Mark completed destinations as identity mappings as we go.
+	for i := range order {
+		if int(order[i]) == i {
+			continue
+		}
+		head := b.heads[i]
+		suffixLen := b.suffixLens[i]
+		id := b.ids[i]
+		dictStart := b.dictStarts[i]
+		dst := i
+		for {
+			src := int(order[dst])
+			order[dst] = uint16(dst)
+			if src == i {
+				b.heads[dst] = head
+				b.suffixLens[dst] = suffixLen
+				b.ids[dst] = id
+				b.dictStarts[dst] = dictStart
+				break
+			}
+			b.heads[dst] = b.heads[src]
+			b.suffixLens[dst] = b.suffixLens[src]
+			b.ids[dst] = b.ids[src]
+			b.dictStarts[dst] = b.dictStarts[src]
+			dst = src
+		}
+	}
 }
 
 func (m *matcher) finalizeLongBuckets() {
@@ -88,6 +116,7 @@ func (m *matcher) finalizeLongBuckets() {
 			bucket.sortBySuffixLen()
 		}
 	}
+	m.longBucketsFinalized = true
 }
 
 // newMatcher creates a new empty longest prefix matcher.
@@ -143,6 +172,7 @@ func (m *matcher) insert(entry []byte, id uint16) bool {
 
 		m.dictionary = append(m.dictionary, suffix...)
 		bucket.appendEntry(head, uint16(suffixLen), id, dictStart)
+		m.longBucketsFinalized = false
 
 		if m.longBits2 == nil {
 			m.longBits2 = new([1024]uint64)
@@ -167,6 +197,8 @@ func (m *matcher) insert(entry []byte, id uint16) bool {
 	return true
 }
 
+// findUnorderedLong preserves greedy matching while buildTokens has appended
+// entries that finalizeLongBuckets has not yet reordered.
 func (m *matcher) findUnorderedLong(bucket *longBucket, inputSuffix []byte, inputHead uint64) (uint16, int, bool) {
 	heads := bucket.heads
 	lens := bucket.suffixLens
@@ -231,15 +263,14 @@ func (m *matcher) find(data []byte) (uint16, int, bool) {
 			inputHead := bytesToU64LE(inputSuffix, inputHeadLen)
 
 			if bucket := m.longMatchBuckets.get(low8); bucket != nil {
-				if !bucket.ordered {
+				if !m.longBucketsFinalized {
 					if id, length, ok := m.findUnorderedLong(bucket, inputSuffix, inputHead); ok {
 						return id, length, true
 					}
 				} else {
 					heads := bucket.heads
 					lens := bucket.suffixLens
-					for _, entryIndex := range bucket.order {
-						i := int(entryIndex)
+					for i := range heads {
 						sLen := int(lens[i])
 						if sLen > len(inputSuffix) {
 							continue

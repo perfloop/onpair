@@ -78,22 +78,25 @@ func TestOnPair16MatcherFindLongToken(t *testing.T) {
 }
 
 func TestMatcherFindsLongestUnfinalizedLongToken(t *testing.T) {
-	// buildTokens probes the matcher between insertions, so an append-only
-	// long bucket must still select the longest matching entry before it is
-	// finalized for parsing.
+	// buildTokens probes the matcher between long-token insertions. Exercise
+	// that unfinished phase directly; the public training test covers the
+	// separate finalized traversal after buildTokens returns.
 	m := newMatcher(0)
 	tokens := [][]byte{
 		[]byte("abcdefghz"),
-		[]byte("abcdefghzz"),
-		[]byte("abcdefghzzz"),
+		[]byte("abcdefghzzzzzzzz"),
+		[]byte("abcdefghzzzzzzzzz"),
 	}
 	for i, token := range tokens {
 		if !m.insert(token, uint16(singleByteTokens+i)) {
 			t.Fatalf("insert %d failed", i)
 		}
 	}
+	if m.longBucketsFinalized {
+		t.Fatal("long buckets finalized before training completes")
+	}
 
-	id, n, ok := m.find([]byte("abcdefghzzz_tail"))
+	id, n, ok := m.find([]byte("abcdefghzzzzzzzzz_tail"))
 	if !ok {
 		t.Fatal("expected long match")
 	}
