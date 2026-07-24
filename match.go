@@ -34,7 +34,7 @@ const (
 // skips the table probe entirely when no stored pattern starts with those
 // bytes.
 type matcher struct {
-	longMatchBuckets longBucketTable // 8-byte prefix → candidate bucket (sorted desc by suffix length)
+	longMatchBuckets longBucketTable // 8-byte prefix → candidate bucket with suffix-length order
 	shortMatchLookup [9]u64U16Table  // length → (prefix, token ID)
 	lengthByPrefix2  *[65536]uint8   // bit L set ⇒ some short token of length L starts with these 2 LE bytes
 	longBits2        *[1024]uint64   // bit set ⇒ some long token starts with these 2 LE bytes (65536-bit set)
@@ -44,32 +44,35 @@ type matcher struct {
 	bucketSizeLimit  int
 }
 
-// longBucket is a struct-of-arrays layout. heads + suffixLens are the hot
-// arrays touched on every probe (reject path); ids + dictStarts are cold,
-// read only when the packed head matches and the suffix exceeds 8 bytes.
-// Keeping them in parallel slices cuts the reject-path working set from
-// 16 B/entry (the equivalent AoS struct) to 10 B/entry.
+// longBucket is a struct-of-arrays layout with append-only entry storage.
+// heads + suffixLens are the hot arrays touched on every probe (reject path);
+// ids + dictStarts are cold, read only when the packed head matches and the
+// suffix exceeds 8 bytes. order supplies the greedy longest-first traversal
+// without moving all four payload arrays for each insertion.
 type longBucket struct {
 	heads      []uint64 // first min(suffixLen, 8) bytes of suffix, LE, zero-extended
 	suffixLens []uint16 // bytes past the 8-byte prefix; token length = suffixLen + 8
 	ids        []uint16
 	dictStarts []uint32 // offset in m.dictionary where this suffix starts
+	order      []uint32 // entry indexes sorted by descending suffix length
 }
 
 func (b *longBucket) len() int { return len(b.heads) }
 
 func (b *longBucket) appendEntry(head uint64, suffixLen uint16, id uint16, dictStart uint32) {
+	entryIndex := uint32(len(b.heads))
 	b.heads = append(b.heads, head)
 	b.suffixLens = append(b.suffixLens, suffixLen)
 	b.ids = append(b.ids, id)
 	b.dictStarts = append(b.dictStarts, dictStart)
-}
 
-func (b *longBucket) swap(i, j int) {
-	b.heads[i], b.heads[j] = b.heads[j], b.heads[i]
-	b.suffixLens[i], b.suffixLens[j] = b.suffixLens[j], b.suffixLens[i]
-	b.ids[i], b.ids[j] = b.ids[j], b.ids[i]
-	b.dictStarts[i], b.dictStarts[j] = b.dictStarts[j], b.dictStarts[i]
+	b.order = append(b.order, entryIndex)
+	insertAt := len(b.order) - 1
+	for insertAt > 0 && b.suffixLens[entryIndex] > b.suffixLens[b.order[insertAt-1]] {
+		b.order[insertAt] = b.order[insertAt-1]
+		insertAt--
+	}
+	b.order[insertAt] = entryIndex
 }
 
 // newMatcher creates a new empty longest prefix matcher.
@@ -134,15 +137,6 @@ func (m *matcher) insert(entry []byte, id uint16) bool {
 		p2 := uint16(prefix)
 		m.longBits2[p2>>6] |= 1 << (p2 & 63)
 
-		// Sort by suffix length (longest first) for greedy matching.
-		// Insertion sort as we add one at a time.
-		for i := bucket.len() - 1; i > 0; i-- {
-			if bucket.suffixLens[i] > bucket.suffixLens[i-1] {
-				bucket.swap(i, i-1)
-			} else {
-				break
-			}
-		}
 	} else {
 		// Single-byte tokens are always byte-value identity tokens.
 		if len(entry) == 1 {
@@ -194,7 +188,8 @@ func (m *matcher) find(data []byte) (uint16, int, bool) {
 			if bucket := m.longMatchBuckets.get(low8); bucket != nil {
 				heads := bucket.heads
 				lens := bucket.suffixLens
-				for i := 0; i < len(heads); i++ {
+				for _, entryIndex := range bucket.order {
+					i := int(entryIndex)
 					sLen := int(lens[i])
 					if sLen > len(inputSuffix) {
 						continue
