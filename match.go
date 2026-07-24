@@ -39,7 +39,6 @@ type matcher struct {
 	lengthByPrefix2  *[65536]uint8   // bit L set ⇒ some short token of length L starts with these 2 LE bytes
 	longBits2        *[1024]uint64   // bit set ⇒ some long token starts with these 2 LE bytes (65536-bit set)
 	dictionary       []byte          // Suffix storage for long patterns
-	endPositions     []uint32        // Boundary positions in dictionary
 	onPair16         bool
 	bucketSizeLimit  int
 }
@@ -84,7 +83,6 @@ func newMatcher(maxTokenLen int) *matcher {
 	}
 
 	return &matcher{
-		endPositions:    []uint32{0},
 		onPair16:        onPair16,
 		bucketSizeLimit: bucketSizeLimit,
 	}
@@ -128,7 +126,6 @@ func (m *matcher) insert(entry []byte, id uint16) bool {
 		dictStart := uint32(len(m.dictionary))
 
 		m.dictionary = append(m.dictionary, suffix...)
-		m.endPositions = append(m.endPositions, uint32(len(m.dictionary)))
 		bucket.appendEntry(head, uint16(suffixLen), id, dictStart)
 
 		if m.longBits2 == nil {
@@ -140,7 +137,6 @@ func (m *matcher) insert(entry []byte, id uint16) bool {
 	} else {
 		// Single-byte tokens are always byte-value identity tokens.
 		if len(entry) == 1 {
-			m.endPositions = append(m.endPositions, uint32(len(m.dictionary)))
 			return true
 		}
 
@@ -151,7 +147,6 @@ func (m *matcher) insert(entry []byte, id uint16) bool {
 			m.lengthByPrefix2 = new([65536]uint8)
 		}
 		m.lengthByPrefix2[uint16(prefix)] |= 1 << uint(len(entry))
-		m.endPositions = append(m.endPositions, uint32(len(m.dictionary)))
 	}
 	return true
 }
