@@ -74,7 +74,7 @@ func (b *longBucket) sortBySuffixLen() {
 	for i := range order {
 		order[i] = uint16(i)
 	}
-	sort.SliceStable(order, func(i, j int) bool {
+	sort.Slice(order, func(i, j int) bool {
 		return b.suffixLens[order[i]] > b.suffixLens[order[j]]
 	})
 
