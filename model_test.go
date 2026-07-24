@@ -154,7 +154,9 @@ func trainModelSharedKeyFixture(tb testing.TB, variants int, reverse bool, sampl
 			tb.Fatalf("row %d does not retain the common 16-byte suffix key", i)
 		}
 	}
-	opts := []Option{WithThreshold(2)}
+	// Threshold one deterministically materializes each repeated variant, so the
+	// fixture can inspect the exact equal-length candidate group it benchmarks.
+	opts := []Option{WithThreshold(1)}
 	if sampleBytes != 0 {
 		opts = append(opts, WithTrainingSampleBytes(sampleBytes))
 	}
@@ -170,7 +172,49 @@ func trainModelSharedKeyFixture(tb testing.TB, variants int, reverse bool, sampl
 	if got < variants {
 		tb.Fatalf("trained shared-key bucket: got %d entries, want at least %d", got, variants)
 	}
+	suffixLen := len(rows[0]) - minMatch
+	wantTails := make(map[string]struct{}, variants)
+	for _, row := range rows {
+		wantTails[row[minMatch+len(modelSharedKeyHead):]] = struct{}{}
+	}
+	gotTails := make(map[string]struct{}, variants)
+	keys := make(map[uint64]struct{}, variants)
+	commonCandidates := 0
+	for _, candidate := range bucket.candidates {
+		if int(candidate.suffixLen) != suffixLen {
+			continue
+		}
+		start := int(candidate.dictStart)
+		suffix := model.matcher.dictionary[start : start+suffixLen]
+		if string(suffix[:len(modelSharedKeyHead)]) != modelSharedKeyHead {
+			continue
+		}
+		commonCandidates++
+		tail := string(suffix[len(modelSharedKeyHead):])
+		if _, wanted := wantTails[tail]; wanted {
+			gotTails[tail] = struct{}{}
+			keys[candidate.key] = struct{}{}
+		}
+	}
+	if commonCandidates != variants || len(gotTails) != variants || len(keys) != variants {
+		tb.Fatalf("trained fixture: candidates=%d tails=%d keys=%d want %d", commonCandidates, len(gotTails), len(keys), variants)
+	}
 	return model, rows
+}
+
+func modelSharedKeyRejectVisits(model *Model, reject string) int {
+	bucket := model.matcher.longMatchBuckets.get(bytesToU64LE([]byte(modelSharedKeyPrefix), minMatch))
+	suffix := []byte(reject)[minMatch:]
+	end := bucket.lookupGroupEnd(longBucketGroupKey(suffix, model.matcher.groupSeed), len(suffix))
+	visits := 0
+	for i := end; i >= 0; {
+		visits++
+		if bucket.previous == nil {
+			break
+		}
+		i = int(bucket.previous[i])
+	}
+	return visits
 }
 
 func TestModelSharedSuffixKeyFixture(t *testing.T) {
@@ -192,15 +236,34 @@ func TestModelSharedSuffixKeyFixture(t *testing.T) {
 	if _, matchLen, ok := model.matcher.find([]byte(reject)); !ok || matchLen >= len(reject) {
 		t.Fatalf("rejecting probe should fall back from the full shared-key token: match length %d, found %t", matchLen, ok)
 	}
+	if visits := modelSharedKeyRejectVisits(model, reject); visits != 0 {
+		t.Fatalf("rejecting probe would traverse %d previous candidates", visits)
+	}
+	bucket := model.matcher.longMatchBuckets.get(bytesToU64LE([]byte(modelSharedKeyPrefix), minMatch))
+	if probes, _ := longTailGroupSlotProbes(bucket, longBucketGroupKey([]byte(reject)[minMatch:], model.matcher.groupSeed), len(reject)-minMatch); probes == 0 {
+		t.Fatal("rejecting probe did not query the seeded group table")
+	}
+}
+
+func TestModelSharedSuffixKeyPerMatcherSeed(t *testing.T) {
+	first, _ := trainModelSharedKeyFixture(t, 273, false, 0)
+	second, _ := trainModelSharedKeyFixture(t, 273, false, 0)
+	if !first.matcher.groupSeedSet || !second.matcher.groupSeedSet || first.matcher.groupSeed == second.matcher.groupSeed {
+		t.Fatal("separate trained matchers did not receive distinct indexed-group seeds")
+	}
+	reject := fmt.Sprintf("%s%sffff%s", modelSharedKeyPrefix, modelSharedKeyHead, modelSharedKeyTail)
+	if modelSharedKeyRejectVisits(first, reject) != 0 || modelSharedKeyRejectVisits(second, reject) != 0 {
+		t.Fatal("a repeated seeded matcher query would traverse a previous-candidate chain")
+	}
 }
 
 func benchmarkModelTrainSharedSuffixKeyReverse(b *testing.B, variants, sampleBytes int) {
-	rows := reverseModelSharedKeyDiscovery(modelSharedKeyRows(variants))
+	_, rows := trainModelSharedKeyFixture(b, variants, true, sampleBytes)
 	totalBytes := int64(0)
 	for _, row := range rows {
 		totalBytes += int64(len(row))
 	}
-	opts := []Option{WithThreshold(2)}
+	opts := []Option{WithThreshold(1)}
 	if sampleBytes != 0 {
 		opts = append(opts, WithTrainingSampleBytes(sampleBytes))
 	}
@@ -230,6 +293,15 @@ func benchmarkModelEncodeSharedSuffixKeyReject(b *testing.B, variants, sampleByt
 		b.Fatal(err)
 	}
 	want := len(archive.CompressedData)
+	visits := modelSharedKeyRejectVisits(model, reject)
+	if visits != 0 {
+		b.Fatalf("rejecting probe would traverse %d previous candidates", visits)
+	}
+	bucket := model.matcher.longMatchBuckets.get(bytesToU64LE([]byte(modelSharedKeyPrefix), minMatch))
+	probes, _ := longTailGroupSlotProbes(bucket, longBucketGroupKey([]byte(reject)[minMatch:], model.matcher.groupSeed), len(reject)-minMatch)
+	if probes == 0 {
+		b.Fatal("rejecting probe did not query the seeded group table")
+	}
 	totalBytes := int64(len(reject) * len(rows))
 	b.ReportAllocs()
 	b.SetBytes(totalBytes)
@@ -244,6 +316,8 @@ func benchmarkModelEncodeSharedSuffixKeyReject(b *testing.B, variants, sampleByt
 		}
 	}
 	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*int(totalBytes)), "ns/byte")
+	b.ReportMetric(float64(visits), "previous-chain-visits/op")
+	b.ReportMetric(float64(probes), "group-slot-probes/op")
 }
 
 func TestModelEncodeWithoutTrain(t *testing.T) {
