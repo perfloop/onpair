@@ -94,13 +94,23 @@ func longBucketGroupHash(head uint64, headLen int) uint64 {
 }
 
 func (b *longBucket) appendCandidate(candidate longBucketCandidate) {
-	if len(b.candidates) == cap(b.candidates) && len(b.candidates) == longBucketIndexThreshold {
-		// The first group table adds two index-threshold windows. Reserve that
-		// same construction window for candidates so it does not immediately
-		// copy again after the index becomes active.
-		next := make([]longBucketCandidate, len(b.candidates), len(b.candidates)+initialLongBucketGroupSlotCount)
-		copy(next, b.candidates)
-		b.candidates = next
+	if len(b.candidates) == cap(b.candidates) {
+		nextCapacity := 0
+		if len(b.candidates) == longBucketIndexThreshold {
+			// The first group table adds two index-threshold windows. Reserve that
+			// same construction window for candidates so it does not immediately
+			// copy again after the index becomes active.
+			nextCapacity = len(b.candidates) + initialLongBucketGroupSlotCount
+		} else if len(b.candidates) >= longBucketIndexThreshold {
+			// Indexed buckets append only; doubling avoids retaining the runtime's
+			// intermediate backing arrays as a large bucket is trained.
+			nextCapacity = cap(b.candidates) * 2
+		}
+		if nextCapacity != 0 {
+			next := make([]longBucketCandidate, len(b.candidates), nextCapacity)
+			copy(next, b.candidates)
+			b.candidates = next
+		}
 	}
 	b.candidates = append(b.candidates, candidate)
 }
