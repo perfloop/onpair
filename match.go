@@ -51,16 +51,18 @@ type longBucket struct {
 	candidates  []longBucketCandidate
 	previous    []uint16 // prior candidate in the same suffix-head group, or noLongBucketCandidate
 	groupSlots  []uint16 // open-addressed group key → latest candidate slot; zero means empty
-	groupMask   uint64
+	groupCount  int
 	headLenMask uint16 // bit L set => a group with min(suffixLen, 8) == L exists
 }
 
 const (
-	noLongBucketCandidate           = ^uint16(0)
-	longBucketIndexThreshold        = maxOnPair16BucketSize
-	compactCandidateGrowthThreshold = maxOnPair16BucketSize
-	compactCandidateCapacity        = 3 * maxOnPair16BucketSize
-	initialLongBucketGroupSlotCount = 512
+	noLongBucketCandidate            = ^uint16(0)
+	longBucketIndexThreshold         = maxOnPair16BucketSize
+	initialLongBucketGroupSlotCount  = 2 * maxOnPair16BucketSize
+	longBucketGroupLoadNumerator     = 7
+	longBucketGroupLoadDenominator   = 8
+	longBucketGroupGrowthNumerator   = 5
+	longBucketGroupGrowthDenominator = 2
 )
 
 type longBucketCandidate struct {
@@ -82,7 +84,7 @@ func suffixHeadLen(suffixLen uint16) int {
 
 func longBucketGroupHash(head uint64, headLen int) uint64 {
 	// The suffix head is attacker supplied, so mix both the packed bytes and
-	// length class before masking an open-addressed group table.
+	// length class before probing the open-addressed group table.
 	head ^= uint64(headLen) * 0x9e3779b97f4a7c15
 	head ^= head >> 30
 	head *= 0xbf58476d1ce4e5b9
@@ -92,30 +94,39 @@ func longBucketGroupHash(head uint64, headLen int) uint64 {
 }
 
 func (b *longBucket) appendCandidate(candidate longBucketCandidate) {
-	if len(b.candidates) == cap(b.candidates) && cap(b.candidates) == compactCandidateGrowthThreshold {
-		// The normal runtime growth step retains a 512-entry backing array for
-		// a bucket that only just exceeded the indexed construction window.
-		// Three bounded-window blocks keep that allocation proportional to the
-		// live large bucket; later growth reverts to the runtime's policy.
-		next := make([]longBucketCandidate, len(b.candidates), compactCandidateCapacity)
+	if len(b.candidates) == cap(b.candidates) && len(b.candidates) == longBucketIndexThreshold {
+		// The first group table adds two index-threshold windows. Reserve that
+		// same construction window for candidates so it does not immediately
+		// copy again after the index becomes active.
+		next := make([]longBucketCandidate, len(b.candidates), len(b.candidates)+initialLongBucketGroupSlotCount)
 		copy(next, b.candidates)
 		b.candidates = next
 	}
 	b.candidates = append(b.candidates, candidate)
 }
 
+// longBucketGroupStartSlot maps a mixed hash into an arbitrary-sized table.
+// This permits a larger resize step without retaining power-of-two tables.
+func longBucketGroupStartSlot(head uint64, headLen, slotCount int) int {
+	high, _ := bits.Mul64(longBucketGroupHash(head, headLen), uint64(slotCount))
+	return int(high)
+}
+
 func (b *longBucket) groupSlot(head uint64, headLen int) int {
-	slot := longBucketGroupHash(head, headLen) & b.groupMask
+	slot := longBucketGroupStartSlot(head, headLen, len(b.groupSlots))
 	for {
 		entry := b.groupSlots[slot]
 		if entry == 0 {
-			return int(slot)
+			return slot
 		}
 		candidate := &b.candidates[entry-1]
 		if suffixHeadLen(candidate.suffixLen) == headLen && candidate.head == head {
-			return int(slot)
+			return slot
 		}
-		slot = (slot + 1) & b.groupMask
+		slot++
+		if slot == len(b.groupSlots) {
+			slot = 0
+		}
 	}
 }
 
@@ -131,7 +142,7 @@ func (b *longBucket) enablePrevious() {
 
 func (b *longBucket) buildGroupSlots() {
 	b.groupSlots = make([]uint16, initialLongBucketGroupSlotCount)
-	b.groupMask = uint64(len(b.groupSlots) - 1)
+	b.groupCount = 0
 	for i := range b.candidates {
 		candidate := &b.candidates[i]
 		headLen := suffixHeadLen(candidate.suffixLen)
@@ -140,6 +151,8 @@ func (b *longBucket) buildGroupSlots() {
 		if previous != 0 {
 			b.enablePrevious()
 			b.previous[i] = previous - 1
+		} else {
+			b.groupCount++
 		}
 		b.groupSlots[slot] = uint16(i + 1)
 	}
@@ -147,8 +160,10 @@ func (b *longBucket) buildGroupSlots() {
 
 func (b *longBucket) growGroupSlots() {
 	oldSlots := b.groupSlots
-	b.groupSlots = make([]uint16, len(oldSlots)*2)
-	b.groupMask = uint64(len(b.groupSlots) - 1)
+	// Resizing at 7/8 load into 5/2 times as many slots starts the new table
+	// below 35% load, avoiding the intermediate allocation ladder.
+	newSlotCount := len(oldSlots) * longBucketGroupGrowthNumerator / longBucketGroupGrowthDenominator
+	b.groupSlots = make([]uint16, newSlotCount)
 	for i := range b.candidates {
 		candidate := &b.candidates[i]
 		headLen := suffixHeadLen(candidate.suffixLen)
@@ -179,6 +194,17 @@ func (b *longBucket) appendOrdered(candidate longBucketCandidate, headLen int) {
 	b.headLenMask |= 1 << uint(headLen)
 }
 
+// hasOnlyGroup is valid while candidates retain their pre-index sort order.
+func (b *longBucket) hasOnlyGroup(head uint64, headLen int) bool {
+	if len(b.candidates) == 0 {
+		return false
+	}
+	first := &b.candidates[0]
+	last := &b.candidates[len(b.candidates)-1]
+	return suffixHeadLen(first.suffixLen) == headLen && first.head == head &&
+		suffixHeadLen(last.suffixLen) == headLen && last.head == head
+}
+
 func (b *longBucket) appendEntry(head uint64, suffixLen uint16, id uint16, dictStart uint32) {
 	headLen := suffixHeadLen(suffixLen)
 	head &= masks[headLen]
@@ -192,10 +218,27 @@ func (b *longBucket) appendEntry(head uint64, suffixLen uint16, id uint16, dictS
 		b.appendOrdered(candidate, headLen)
 		return
 	}
-	if b.groupSlots != nil && (len(b.candidates)+1)*4 >= len(b.groupSlots)*3 {
-		// Rehash before appending so the new candidate cannot be mistaken for
-		// the previous member of its own group.
-		b.growGroupSlots()
+	if b.groupSlots == nil && b.hasOnlyGroup(head, headLen) {
+		// A single suffix-head group has no unrelated heads to skip. Retain its
+		// existing length order without allocating index or linkage storage.
+		if suffixLen <= b.candidates[len(b.candidates)-1].suffixLen {
+			b.appendCandidate(candidate)
+			b.headLenMask |= 1 << uint(headLen)
+			return
+		}
+		b.appendOrdered(candidate, headLen)
+		return
+	}
+	slot, existingGroup := 0, false
+	if b.groupSlots != nil {
+		slot = b.groupSlot(head, headLen)
+		existingGroup = b.groupSlots[slot] != 0
+		if !existingGroup && (b.groupCount+1)*longBucketGroupLoadDenominator > len(b.groupSlots)*longBucketGroupLoadNumerator {
+			// Only a new group consumes a slot. Rebuild the accumulated entries
+			// before appending it, so it cannot be linked to an old group.
+			b.growGroupSlots()
+			slot = b.groupSlot(head, headLen)
+		}
 	}
 	candidateSlot := len(b.candidates)
 	b.appendCandidate(candidate)
@@ -211,11 +254,12 @@ func (b *longBucket) appendEntry(head uint64, suffixLen uint16, id uint16, dictS
 	if b.groupSlots == nil {
 		return
 	}
-	slot := b.groupSlot(head, headLen)
 	previous := b.groupSlots[slot]
 	if previous != 0 {
 		b.enablePrevious()
 		b.previous[candidateSlot] = previous - 1
+	} else if !existingGroup {
+		b.groupCount++
 	}
 	b.groupSlots[slot] = uint16(candidateSlot + 1)
 }
@@ -397,6 +441,21 @@ func (m *matcher) find(data []byte) (uint16, int, bool) {
 							}
 							if bestLen >= 0 {
 								return bestID, minMatch + bestLen, true
+							}
+						}
+					} else if bucket.hasOnlyGroup(inputHead&masks[headLen], headLen) {
+						for i := range bucket.candidates {
+							candidate := &bucket.candidates[i]
+							sLen := int(candidate.suffixLen)
+							if sLen > len(inputSuffix) {
+								continue
+							}
+							if sLen <= minMatch {
+								return candidate.id, minMatch + sLen, true
+							}
+							start := int(candidate.dictStart)
+							if bytes.Equal(m.dictionary[start+minMatch:start+sLen], inputSuffix[minMatch:sLen]) {
+								return candidate.id, minMatch + sLen, true
 							}
 						}
 					} else if candidateStart := bucket.lookupGroupStart(inputHead, headLen); candidateStart >= 0 {
