@@ -77,7 +77,7 @@ func TestLongBucketTrainingPreservesGreedyMatches(t *testing.T) {
 		t.Fatal("trained token boundaries differ from the deterministic progressive-prefix boundaries")
 	}
 
-	for length := 2; length <= len(row); length++ {
+	checkMatch := func(length int) {
 		probe := make([]byte, length+1)
 		copy(probe, row[:length])
 		probe[length] = '!'
@@ -87,6 +87,12 @@ func TestLongBucketTrainingPreservesGreedyMatches(t *testing.T) {
 		if !ok || id != wantID || gotLength != length {
 			t.Fatalf("find(%d-byte token): got id=%d length=%d ok=%t, want id=%d length=%d", length, id, gotLength, ok, wantID, length)
 		}
+	}
+	for length := 2; length < minMatch; length++ {
+		checkMatch(length)
+	}
+	for length := minMatch + 1; length <= len(row); length++ {
+		checkMatch(length)
 	}
 
 	queryRows := []string{
