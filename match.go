@@ -167,6 +167,40 @@ func (m *matcher) insert(entry []byte, id uint16) bool {
 	return true
 }
 
+func (m *matcher) findUnorderedLong(bucket *longBucket, inputSuffix []byte, inputHead uint64) (uint16, int, bool) {
+	heads := bucket.heads
+	lens := bucket.suffixLens
+	bestIndex := -1
+	bestSuffixLen := 0
+	for i := range heads {
+		sLen := int(lens[i])
+		if sLen > len(inputSuffix) {
+			continue
+		}
+		mLen := sLen
+		if mLen > minMatch {
+			mLen = minMatch
+		}
+		if (heads[i]^inputHead)&masks[mLen] != 0 {
+			continue
+		}
+		if sLen > minMatch {
+			start := int(bucket.dictStarts[i])
+			if !bytes.Equal(m.dictionary[start+minMatch:start+sLen], inputSuffix[minMatch:sLen]) {
+				continue
+			}
+		}
+		if sLen > bestSuffixLen {
+			bestIndex = i
+			bestSuffixLen = sLen
+		}
+	}
+	if bestIndex < 0 {
+		return 0, 0, false
+	}
+	return bucket.ids[bestIndex], minMatch + bestSuffixLen, true
+}
+
 // find finds the longest matching pattern for the given input data.
 //
 // Returns the token ID and match length for the longest pattern that matches
@@ -197,43 +231,38 @@ func (m *matcher) find(data []byte) (uint16, int, bool) {
 			inputHead := bytesToU64LE(inputSuffix, inputHeadLen)
 
 			if bucket := m.longMatchBuckets.get(low8); bucket != nil {
-				heads := bucket.heads
-				lens := bucket.suffixLens
-				bestIndex := -1
-				bestSuffixLen := 0
-				for _, entryIndex := range bucket.order {
-					i := int(entryIndex)
-					sLen := int(lens[i])
-					if sLen > len(inputSuffix) {
-						continue
+				if !bucket.ordered {
+					if id, length, ok := m.findUnorderedLong(bucket, inputSuffix, inputHead); ok {
+						return id, length, true
 					}
-					// Packed head prefilter: XOR the stored head with the input's
-					// head masked to the relevant length. For suffixes ≤ 8 bytes
-					// this is authoritative; otherwise it's a cheap reject.
-					mLen := sLen
-					if mLen > minMatch {
-						mLen = minMatch
-					}
-					if (heads[i]^inputHead)&masks[mLen] != 0 {
-						continue
-					}
-					if sLen > minMatch {
-						// Suffix longer than 8 bytes: verify the tail past the head.
-						start := int(bucket.dictStarts[i])
-						if !bytes.Equal(m.dictionary[start+minMatch:start+sLen], inputSuffix[minMatch:sLen]) {
+				} else {
+					heads := bucket.heads
+					lens := bucket.suffixLens
+					for _, entryIndex := range bucket.order {
+						i := int(entryIndex)
+						sLen := int(lens[i])
+						if sLen > len(inputSuffix) {
 							continue
 						}
+						// Packed head prefilter: XOR the stored head with the input's
+						// head masked to the relevant length. For suffixes ≤ 8 bytes
+						// this is authoritative; otherwise it's a cheap reject.
+						mLen := sLen
+						if mLen > minMatch {
+							mLen = minMatch
+						}
+						if (heads[i]^inputHead)&masks[mLen] != 0 {
+							continue
+						}
+						if sLen <= minMatch {
+							return bucket.ids[i], minMatch + sLen, true
+						}
+						// Suffix longer than 8 bytes: verify the tail past the head.
+						start := int(bucket.dictStarts[i])
+						if bytes.Equal(m.dictionary[start+minMatch:start+sLen], inputSuffix[minMatch:sLen]) {
+							return bucket.ids[i], minMatch + sLen, true
+						}
 					}
-					if bucket.ordered {
-						return bucket.ids[i], minMatch + sLen, true
-					}
-					if sLen > bestSuffixLen {
-						bestIndex = i
-						bestSuffixLen = sLen
-					}
-				}
-				if bestIndex >= 0 {
-					return bucket.ids[bestIndex], minMatch + bestSuffixLen, true
 				}
 			}
 		}
