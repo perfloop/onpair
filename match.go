@@ -57,6 +57,7 @@ type longBucket struct {
 }
 
 func (b *longBucket) len() int { return len(b.heads) }
+func (b *longBucket) Len() int { return len(b.heads) }
 
 func (b *longBucket) appendEntry(head uint64, suffixLen uint16, id uint16, dictStart uint32) {
 	b.heads = append(b.heads, head)
@@ -65,16 +66,22 @@ func (b *longBucket) appendEntry(head uint64, suffixLen uint16, id uint16, dictS
 	b.dictStarts = append(b.dictStarts, dictStart)
 }
 
+func (b *longBucket) Less(i, j int) bool { return b.suffixLens[i] > b.suffixLens[j] }
+
+func (b *longBucket) Swap(i, j int) {
+	b.heads[i], b.heads[j] = b.heads[j], b.heads[i]
+	b.suffixLens[i], b.suffixLens[j] = b.suffixLens[j], b.suffixLens[i]
+	b.ids[i], b.ids[j] = b.ids[j], b.ids[i]
+	b.dictStarts[i], b.dictStarts[j] = b.dictStarts[j], b.dictStarts[i]
+}
+
 func (b *longBucket) sortBySuffixLen() {
 	switch len(b.heads) {
 	case 0, 1:
 		return
 	case 2:
-		if b.suffixLens[1] > b.suffixLens[0] {
-			b.heads[0], b.heads[1] = b.heads[1], b.heads[0]
-			b.suffixLens[0], b.suffixLens[1] = b.suffixLens[1], b.suffixLens[0]
-			b.ids[0], b.ids[1] = b.ids[1], b.ids[0]
-			b.dictStarts[0], b.dictStarts[1] = b.dictStarts[1], b.dictStarts[0]
+		if b.Less(1, 0) {
+			b.Swap(0, 1)
 		}
 		return
 	}
@@ -90,46 +97,9 @@ func (b *longBucket) sortBySuffixLen() {
 		return
 	}
 
-	// Production token IDs are sequential uint16 values, with the first 256
-	// reserved for byte tokens, so a long bucket has at most 65,280 entries.
-	// A uint16 order is therefore sufficient while training is finalized.
-	order := make([]uint16, len(b.heads))
-	for i := range order {
-		order[i] = uint16(i)
-	}
-	sort.Slice(order, func(i, j int) bool {
-		return b.suffixLens[order[i]] > b.suffixLens[order[j]]
-	})
-
-	// order maps each destination to its source entry. Rotate each cycle in
-	// place so parsing can walk the sorted payload arrays without an index
-	// lookup. Mark completed destinations as identity mappings as we go.
-	for i := range order {
-		if int(order[i]) == i {
-			continue
-		}
-		head := b.heads[i]
-		suffixLen := b.suffixLens[i]
-		id := b.ids[i]
-		dictStart := b.dictStarts[i]
-		dst := i
-		for {
-			src := int(order[dst])
-			order[dst] = uint16(dst)
-			if src == i {
-				b.heads[dst] = head
-				b.suffixLens[dst] = suffixLen
-				b.ids[dst] = id
-				b.dictStarts[dst] = dictStart
-				break
-			}
-			b.heads[dst] = b.heads[src]
-			b.suffixLens[dst] = b.suffixLens[src]
-			b.ids[dst] = b.ids[src]
-			b.dictStarts[dst] = b.dictStarts[src]
-			dst = src
-		}
-	}
+	// sort.Sort uses longBucket.Swap to move the aligned payload arrays in
+	// place. Unlike the temporary permutation, it adds no per-bucket storage.
+	sort.Sort(b)
 }
 
 func (m *matcher) finalizeLongBuckets() {
