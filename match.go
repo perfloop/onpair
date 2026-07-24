@@ -67,6 +67,10 @@ func (b *longBucket) appendEntry(head uint64, suffixLen uint16, id uint16, dictS
 }
 
 func (b *longBucket) sortBySuffixLen() {
+	if len(b.heads) < 2 {
+		return
+	}
+
 	// Production token IDs are sequential uint16 values, with the first 256
 	// reserved for byte tokens, so a long bucket has at most 65,280 entries.
 	// A uint16 order is therefore sufficient while training is finalized.
