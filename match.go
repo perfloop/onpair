@@ -44,72 +44,82 @@ type matcher struct {
 	bucketSizeLimit  int
 }
 
-// longBucket groups suffixes by the bytes that find uses for its packed-head
-// prefilter. Groups share candidate storage, and each group links its entries
-// in descending suffix-length order so lookup still preserves greedy matching.
+// longBucket keeps a secondary index ordered by the packed suffix head and
+// its length class. The matching group is contiguous, with longer suffixes
+// first, so lookup remains greedy without scanning unrelated heads.
 type longBucket struct {
-	groupsByHead map[longBucketGroupKey]uint32 // group slot + 1; zero means absent
-	groups       []longBucketGroup
-	candidates   []longBucketCandidate
-	headLenMask  uint16 // bit L set => a group with min(suffixLen, 8) == L exists
-}
-
-type longBucketGroupKey struct {
-	head    uint64
-	headLen uint8
-}
-
-type longBucketGroup struct {
-	first uint32 // candidate slot + 1; zero means empty
+	candidates  []longBucketCandidate
+	headLenMask uint16 // bit L set => a group with min(suffixLen, 8) == L exists
 }
 
 type longBucketCandidate struct {
+	head      uint64 // first min(suffixLen, 8) bytes of suffix, LE, zero-extended
+	dictStart uint32 // offset in m.dictionary where this suffix starts
 	suffixLen uint16 // bytes past the 8-byte prefix
 	id        uint16
-	dictStart uint32 // offset in m.dictionary where this suffix starts
-	next      uint32 // candidate slot + 1; zero means end
 }
 
 func (b *longBucket) len() int { return len(b.candidates) }
 
-func (b *longBucket) appendEntry(head uint64, suffixLen uint16, id uint16, dictStart uint32) {
+func suffixHeadLen(suffixLen uint16) int {
 	headLen := int(suffixLen)
 	if headLen > minMatch {
-		headLen = minMatch
+		return minMatch
 	}
-	key := longBucketGroupKey{head: head & masks[headLen], headLen: uint8(headLen)}
-	if b.groupsByHead == nil {
-		b.groupsByHead = make(map[longBucketGroupKey]uint32)
-	}
-	groupSlot := b.groupsByHead[key]
-	if groupSlot == 0 {
-		b.groups = append(b.groups, longBucketGroup{})
-		groupSlot = uint32(len(b.groups))
-		b.groupsByHead[key] = groupSlot
-	}
+	return headLen
+}
 
-	candidateSlot := uint32(len(b.candidates) + 1)
-	b.candidates = append(b.candidates, longBucketCandidate{
+func (b *longBucket) appendEntry(head uint64, suffixLen uint16, id uint16, dictStart uint32) {
+	headLen := suffixHeadLen(suffixLen)
+	head &= masks[headLen]
+
+	// Keep candidates ordered by (head length, head, descending suffix length).
+	// Equal-length entries remain stable, matching the old insertion sort.
+	lo, hi := 0, len(b.candidates)
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		candidate := &b.candidates[mid]
+		candidateHeadLen := suffixHeadLen(candidate.suffixLen)
+		if candidateHeadLen < headLen ||
+			(candidateHeadLen == headLen && (candidate.head < head ||
+				(candidate.head == head && candidate.suffixLen >= suffixLen))) {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	b.candidates = append(b.candidates, longBucketCandidate{})
+	copy(b.candidates[lo+1:], b.candidates[lo:])
+	b.candidates[lo] = longBucketCandidate{
+		head:      head,
+		dictStart: dictStart,
 		suffixLen: suffixLen,
 		id:        id,
-		dictStart: dictStart,
-	})
-	group := &b.groups[groupSlot-1]
-	link := &group.first
-	for *link != 0 && b.candidates[*link-1].suffixLen >= suffixLen {
-		link = &b.candidates[*link-1].next
 	}
-	b.candidates[candidateSlot-1].next = *link
-	*link = candidateSlot
 	b.headLenMask |= 1 << uint(headLen)
 }
 
-func (b *longBucket) lookupGroup(head uint64, headLen int) *longBucketGroup {
-	groupSlot := b.groupsByHead[longBucketGroupKey{head: head & masks[headLen], headLen: uint8(headLen)}]
-	if groupSlot == 0 {
-		return nil
+func (b *longBucket) lookupGroupStart(head uint64, headLen int) int {
+	head &= masks[headLen]
+	lo, hi := 0, len(b.candidates)
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		candidate := &b.candidates[mid]
+		candidateHeadLen := suffixHeadLen(candidate.suffixLen)
+		if candidateHeadLen < headLen || (candidateHeadLen == headLen && candidate.head < head) {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
 	}
-	return &b.groups[groupSlot-1]
+	if lo == len(b.candidates) {
+		return -1
+	}
+	candidate := &b.candidates[lo]
+	if suffixHeadLen(candidate.suffixLen) != headLen || candidate.head != head {
+		return -1
+	}
+	return lo
 }
 
 // newMatcher creates a new empty longest prefix matcher.
@@ -227,11 +237,14 @@ func (m *matcher) find(data []byte) (uint16, int, bool) {
 				matchingHeadLens &= (1 << (uint(inputHeadLen) + 1)) - 1
 				for matchingHeadLens != 0 {
 					headLen := bits.Len16(matchingHeadLens) - 1
-					group := bucket.lookupGroup(inputHead, headLen)
-					if group != nil {
-						for candidateSlot := group.first; candidateSlot != 0; {
-							candidate := &bucket.candidates[candidateSlot-1]
-							candidateSlot = candidate.next
+					candidateStart := bucket.lookupGroupStart(inputHead, headLen)
+					if candidateStart >= 0 {
+						groupHead := inputHead & masks[headLen]
+						for i := candidateStart; i < len(bucket.candidates); i++ {
+							candidate := &bucket.candidates[i]
+							if suffixHeadLen(candidate.suffixLen) != headLen || candidate.head != groupHead {
+								break
+							}
 							sLen := int(candidate.suffixLen)
 							if sLen > len(inputSuffix) {
 								continue
