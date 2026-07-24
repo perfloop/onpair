@@ -492,6 +492,11 @@ func (e *Encoder) buildTokens(
 		return dictionary, tokenBoundaries
 	}
 
+	// buildTokens can probe a bucket again after adding an entry, so find keeps
+	// an unsorted fallback during training. Finalize once the training pass is
+	// complete so parsing retains longest-first traversal.
+	defer matcher.finalizeLongBuckets()
+
 	// Pre-size the pair-frequency counter from the sampled byte count.
 	// Roughly 1 pair per ~3 bytes of sampled data (empirical), capped.
 	freqHint := sampleBytes / 3

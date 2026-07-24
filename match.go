@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"math"
 	"math/bits"
+	"sort"
 	"unsafe"
 )
 
@@ -46,14 +47,15 @@ type matcher struct {
 // longBucket is a struct-of-arrays layout with append-only entry storage.
 // heads + suffixLens are the hot arrays touched on every probe (reject path);
 // ids + dictStarts are cold, read only when the packed head matches and the
-// suffix exceeds 8 bytes. order supplies the greedy longest-first traversal
-// without moving all four payload arrays for each insertion.
+// suffix exceeds 8 bytes. order is finalized to greedy longest-first order
+// after training, without moving all four payload arrays for each insertion.
 type longBucket struct {
 	heads      []uint64 // first min(suffixLen, 8) bytes of suffix, LE, zero-extended
 	suffixLens []uint16 // bytes past the 8-byte prefix; token length = suffixLen + 8
 	ids        []uint16
 	dictStarts []uint32 // offset in m.dictionary where this suffix starts
-	order      []uint32 // entry indexes sorted by descending suffix length
+	order      []uint32 // entry indexes, sorted by descending suffix length when ordered
+	ordered    bool
 }
 
 func (b *longBucket) len() int { return len(b.heads) }
@@ -66,12 +68,26 @@ func (b *longBucket) appendEntry(head uint64, suffixLen uint16, id uint16, dictS
 	b.dictStarts = append(b.dictStarts, dictStart)
 
 	b.order = append(b.order, entryIndex)
-	insertAt := len(b.order) - 1
-	for insertAt > 0 && b.suffixLens[entryIndex] > b.suffixLens[b.order[insertAt-1]] {
-		b.order[insertAt] = b.order[insertAt-1]
-		insertAt--
+	b.ordered = false
+}
+
+func (b *longBucket) sortBySuffixLen() {
+	if b.ordered {
+		return
 	}
-	b.order[insertAt] = entryIndex
+	sort.SliceStable(b.order, func(i, j int) bool {
+		return b.suffixLens[b.order[i]] > b.suffixLens[b.order[j]]
+	})
+	b.ordered = true
+}
+
+func (m *matcher) finalizeLongBuckets() {
+	for i := range m.longMatchBuckets.entries {
+		bucket := m.longMatchBuckets.entries[i].bucket
+		if bucket != nil {
+			bucket.sortBySuffixLen()
+		}
+	}
 }
 
 // newMatcher creates a new empty longest prefix matcher.
@@ -183,6 +199,8 @@ func (m *matcher) find(data []byte) (uint16, int, bool) {
 			if bucket := m.longMatchBuckets.get(low8); bucket != nil {
 				heads := bucket.heads
 				lens := bucket.suffixLens
+				bestIndex := -1
+				bestSuffixLen := 0
 				for _, entryIndex := range bucket.order {
 					i := int(entryIndex)
 					sLen := int(lens[i])
@@ -199,14 +217,23 @@ func (m *matcher) find(data []byte) (uint16, int, bool) {
 					if (heads[i]^inputHead)&masks[mLen] != 0 {
 						continue
 					}
-					if sLen <= minMatch {
+					if sLen > minMatch {
+						// Suffix longer than 8 bytes: verify the tail past the head.
+						start := int(bucket.dictStarts[i])
+						if !bytes.Equal(m.dictionary[start+minMatch:start+sLen], inputSuffix[minMatch:sLen]) {
+							continue
+						}
+					}
+					if bucket.ordered {
 						return bucket.ids[i], minMatch + sLen, true
 					}
-					// Suffix longer than 8 bytes: verify the tail past the head.
-					start := int(bucket.dictStarts[i])
-					if bytes.Equal(m.dictionary[start+minMatch:start+sLen], inputSuffix[minMatch:sLen]) {
-						return bucket.ids[i], minMatch + sLen, true
+					if sLen > bestSuffixLen {
+						bestIndex = i
+						bestSuffixLen = sLen
 					}
+				}
+				if bestIndex >= 0 {
+					return bucket.ids[bestIndex], minMatch + bestSuffixLen, true
 				}
 			}
 		}
